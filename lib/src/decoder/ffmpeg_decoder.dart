@@ -135,10 +135,10 @@ class FfmpegDecoder {
       pts: Duration(milliseconds: frame.ptsMs),
     ));
   }
-  
+
   void _onLog(int level, Pointer<Utf8> msg) {
     if (level < 2) { // Errors & warnings
-      print('[FFmpeg Log] ${msg.toDartString()}');
+      //print('[FFmpeg Log] ${msg.toDartString()}');
     }
   }
 }
