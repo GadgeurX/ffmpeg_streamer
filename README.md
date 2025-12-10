@@ -16,7 +16,18 @@ A robust Flutter plugin for using FFmpeg to decode video and audio frames via FF
 ### Android
 1. Download Android-compatible FFmpeg `.so` libraries (e.g., from [FFmpegKit](https://github.com/tanersener/ffmpeg-kit) or build yourself).
 2. Place them in your app's `android/source/main/jniLibs/<ABI>/` or configure the plugin `src/main/jniLibs`.
-3. Ensure headers are available if you are rebuilding the C core.
+   Required libraries:
+   - libavformat.so
+   - libavcodec.so
+   - libavutil.so
+   - libswscale.so
+   - libswresample.so
+
+    Headers
+     Place the FFmpeg include directories (libavcodec/, libavformat/, etc.) in:
+     `android/src/main/cpp/include/`
+
+    So you should have `android/src/main/cpp/include/libavcodec/avcodec.h`, etc.
 
 ### iOS & macOS
 1. **iOS**: Add a Pod dependency on an FFmpeg package or vend `ffmpeg.xcframework` in your Podfile.
