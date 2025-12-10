@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+import 'package:ffmpeg_streamer/ffmpeg_streamer.dart';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:ffmpeg_streamer/ffmpeg_streamer.dart';
 
 void main() {
   runApp(const MaterialApp(home: MyApp()));
@@ -20,6 +20,8 @@ class _MyAppState extends State<MyApp> {
   MediaInfo? _mediaInfo;
   ui.Image? _currentFrame;
   bool _isPlaying = false;
+
+  double _lastFrameTimestamp = 0;
   
   @override
   void dispose() {
@@ -59,10 +61,11 @@ class _MyAppState extends State<MyApp> {
         _mediaInfo = info;
       });
 
-      await decoder.play();
-      setState(() {
-        _isPlaying = true;
-      });
+      var frame = await decoder.getFrameAtIndex(0);
+
+      if (frame != null) {
+        _renderFrame(frame);
+      }
       
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -83,7 +86,15 @@ class _MyAppState extends State<MyApp> {
       },
     );
     final image = await completer.future;
-    
+
+    _lastFrameTimestamp = frame.frameId / _mediaInfo!.fps;
+    if (_lastFrameTimestamp >= (_mediaInfo?.duration.inSeconds ?? 0)) {
+      _lastFrameTimestamp = 0;
+      _decoder?.seekToFrame(0);
+      _decoder?.pause();
+      _isPlaying = false;
+    }
+
     if (mounted) {
       setState(() {
         _currentFrame = image;
@@ -101,7 +112,7 @@ class _MyAppState extends State<MyApp> {
             Padding(
               padding: const EdgeInsets.all(8.0),
               child: Text(
-                  '${_mediaInfo!.width}x${_mediaInfo!.height} @ ${_mediaInfo!.fps.toStringAsFixed(2)} fps\nDuration: ${_mediaInfo!.duration}'),
+                  '${_mediaInfo!.width}x${_mediaInfo!.height} @ ${_mediaInfo!.fps.toStringAsFixed(2)} fps\nDuration: ${_mediaInfo!.duration} @ ${_mediaInfo?.totalFrames}'),
             ),
           Expanded(
             child: Center(

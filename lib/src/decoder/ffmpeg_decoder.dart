@@ -6,20 +6,30 @@ import '../ffi/lotterwise_ffmpeg_bindings.dart' as ffi_bindings;
 import '../models/media_info.dart';
 import '../models/frame_data.dart';
 
+/// Represents a source for FFmpeg media, either a file path or a URL.
 class FfmpegMediaSource {
+  /// The path to the media file or the URL string.
   final String path;
+  
+  /// Whether the source is a URL (true) or a local file path (false).
   final bool isUrl;
 
+  /// Creates a media source from a local file path.
   FfmpegMediaSource.fromFile(this.path) : isUrl = false;
+
+  /// Creates a media source from a network URL.
   FfmpegMediaSource.fromUrl(this.path) : isUrl = true;
 }
 
+/// A decoder using FFmpeg native bindings to read video and audio frames.
 class FfmpegDecoder {
   static final ffi_bindings.LotterwiseFfmpegBindings _bindings = 
       ffi_bindings.LotterwiseFfmpegBindings();
   
   static bool _initialized = false;
 
+  /// Ensures that the native FFmpeg bindings are initialized.
+  /// This is called automatically by [open].
   static void ensureInitialized() {
     if (!_initialized) {
       _bindings.init();
@@ -31,7 +41,12 @@ class FfmpegDecoder {
   final _videoController = StreamController<VideoFrame>.broadcast();
   final _audioController = StreamController<AudioFrame>.broadcast();
 
+  /// Stream of decoded video frames.
+  /// Listen to this stream to render video playback.
   Stream<VideoFrame> get videoFrames => _videoController.stream;
+
+  /// Stream of decoded audio frames.
+  /// Listen to this stream to play audio.
   Stream<AudioFrame> get audioFrames => _audioController.stream;
 
   // Native Listeners
@@ -39,6 +54,12 @@ class FfmpegDecoder {
   NativeCallable<ffi_bindings.NativeOnAudioFrame>? _audioListener;
   NativeCallable<ffi_bindings.NativeOnLog>? _logListener;
 
+  /// Opens a media source for decoding.
+  ///
+  /// This initializes the decoder, sets up native callbacks, and opens the
+  /// specified [source].
+  ///
+  /// Throws an exception if opening the media fails.
   Future<void> open(FfmpegMediaSource source) async {
     ensureInitialized();
 
@@ -62,6 +83,9 @@ class FfmpegDecoder {
     }
   }
 
+  /// Retrieves media information such as duration, resolution, and frame rate.
+  /// 
+  /// This should be called after [open].
   Future<MediaInfo> get mediaInfo async {
     final info = _bindings.getMediaInfo();
     return MediaInfo(
@@ -71,22 +95,98 @@ class FfmpegDecoder {
       fps: info.fps,
       audioSampleRate: info.audioSampleRate,
       audioChannels: info.audioChannels,
+      totalFrames: info.totalFrames,
     );
   }
 
+  /// Starts or resumes decoding.
+  ///
+  /// This triggers the native decoder loop which will start emitting frames
+  /// to [videoFrames] and [audioFrames].
   Future<void> play() async {
     _bindings.startDecoding();
     _bindings.resume();
   }
 
+
+
+  /// Pauses decoding.
   Future<void> pause() async {
     _bindings.pause();
   }
+
+
 
   Future<void> seek(Duration position) async {
     _bindings.seek(position.inMilliseconds);
   }
 
+  /// Seeks to a specific frame index.
+  Future<void> seekToFrame(int frameIndex) async {
+    _bindings.seekFrame(frameIndex);
+  }
+
+  /// Retrieves a specific video frame at the given timestamp in milliseconds.
+  ///
+  /// Returns `null` if the frame could not be retrieved.
+  Future<VideoFrame?> getFrameAtTimestamp(int timestampMs) async {
+    final framePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
+    
+    try {
+      final result = _bindings.getFrameAtTimestamp(timestampMs, framePtrPtr);
+      if (result < 0 || framePtrPtr.value == nullptr) {
+        return null;
+      }
+      
+      return _convertAndFreeFrame(framePtrPtr.value);
+    } finally {
+      calloc.free(framePtrPtr);
+    }
+  }
+
+
+
+  /// Retrieves a specific video frame by its index.
+  ///
+  /// Returns `null` if the frame could not be retrieved.
+  Future<VideoFrame?> getFrameAtIndex(int index) async {
+    final framePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
+    
+    try {
+      final result = _bindings.getFrameAtIndex(index, framePtrPtr);
+       if (result < 0 || framePtrPtr.value == nullptr) {
+        return null;
+      }
+      return _convertAndFreeFrame(framePtrPtr.value);
+    } finally {
+      calloc.free(framePtrPtr);
+    }
+  }
+
+  VideoFrame _convertAndFreeFrame(Pointer<ffi_bindings.VideoFrame> framePtr) {
+    try {
+      final frame = framePtr.ref;
+      final size = frame.linesize * frame.height;
+      final data = Uint8List.fromList(frame.data.asTypedList(size));
+      
+      return VideoFrame(
+        rgbaBytes: data,
+        width: frame.width,
+        height: frame.height,
+        pts: Duration(milliseconds: frame.ptsMs),
+        frameId: frame.frameId,
+      );
+    } finally {
+      _bindings.freeFrame(framePtr);
+    }
+  }
+
+
+
+  /// Closes the decoder and releases resources.
+  ///
+  /// Stops the decoding loop and closes stream controllers and native listeners.
+  /// Ideally call [dispose] instead which aliases this method.
   Future<void> close() async {
     _bindings.stop();
     _videoListener?.close();
@@ -96,6 +196,9 @@ class FfmpegDecoder {
     _audioController.close();
   }
 
+
+
+  /// Disposes the decoder, releasing all native and Dart resources.
   void dispose() {
     close();
   }
@@ -116,6 +219,7 @@ class FfmpegDecoder {
       width: frame.width,
       height: frame.height,
       pts: Duration(milliseconds: frame.ptsMs),
+      frameId: frame.frameId,
     ));
   }
 
