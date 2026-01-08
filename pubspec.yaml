@@ -1,6 +1,6 @@
 name: ffmpeg_streamer
 description: "A cross-platform Flutter FFI plugin that embeds FFmpeg to decode audio & video and stream raw frames — works on Android, iOS, macOS, Windows & Linux."
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/GadgeurX/ffmpeg_streamer
 repository: https://github.com/GadgeurX/ffmpeg_streamer.git
 issue_tracker: https://github.com/GadgeurX/ffmpeg_streamer/issues

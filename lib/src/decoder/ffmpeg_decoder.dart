@@ -1,11 +1,18 @@
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import '../ffi/lotterwise_ffmpeg_bindings.dart' as ffi_bindings;
 import '../models/frame_data.dart';
 
-/// FFmpeg-based decoder for media files.
-/// Provides frame-by-frame access to both video and audio content.
+/// Callback type for when a frame is retrieved asynchronously.
+typedef OnFrameCallback = void Function(MediaFrame? frame);
+
+/// Callback type for frame range progress updates.
+typedef OnProgressCallback = void Function(int current, int total);
+
+/// FFmpeg-based decoder for media files with async API.
+/// All frame retrieval is asynchronous using native threads for optimal performance.
 class FfmpegDecoder {
   final ffi_bindings.LotterwiseFfmpegBindings _bindings;
 
@@ -17,22 +24,69 @@ class FfmpegDecoder {
   int _videoHeight = 0;
   double _fps = 0;
   int _totalFrames = 0;
-  int _currentFrameIndex = 0;
 
   int _audioSampleRate = 0;
   int _audioChannels = 0;
 
+  // Callback management
+  final Map<int, _PendingRequest> _pendingRequests = {};
+  int _nextCallbackId = 1;
+
+  // Native callbacks (use static methods with NativeCallable for thread safety)
+  static late final NativeCallable<ffi_bindings.NativeOnVideoFrameCallback>
+      _videoFrameCallable;
+  static late final NativeCallable<ffi_bindings.NativeOnAudioFrameCallback>
+      _audioFrameCallable;
+  static late final NativeCallable<ffi_bindings.NativeOnFrameRangeProgressCallback>
+      _progressCallable;
+
+  static late final Pointer<NativeFunction<ffi_bindings.NativeOnVideoFrameCallback>>
+      _videoFrameCallbackPointer;
+  static late final Pointer<NativeFunction<ffi_bindings.NativeOnAudioFrameCallback>>
+      _audioFrameCallbackPointer;
+  static late final Pointer<
+          NativeFunction<ffi_bindings.NativeOnFrameRangeProgressCallback>>
+      _progressCallbackPointer;
+  
+  static bool _callbacksInitialized = false;
+
   /// Creates a new FFmpeg decoder instance.
   FfmpegDecoder() : _bindings = ffi_bindings.LotterwiseFfmpegBindings() {
     _initialize();
+    _register();
   }
 
   /// Initializes FFmpeg library.
-  Future<void> _initialize() async {
+  void _initialize() {
     if (_isInitialized) return;
 
     _bindings.init();
+
+    // Initialize native callbacks (only once for all instances)
+    if (!_callbacksInitialized) {
+      _videoFrameCallable = NativeCallable<ffi_bindings.NativeOnVideoFrameCallback>.listener(
+        _onVideoFrameCallback,
+      );
+      _audioFrameCallable = NativeCallable<ffi_bindings.NativeOnAudioFrameCallback>.listener(
+        _onAudioFrameCallback,
+      );
+      _progressCallable = NativeCallable<ffi_bindings.NativeOnFrameRangeProgressCallback>.listener(
+        _onProgressCallback,
+      );
+
+      _videoFrameCallbackPointer = _videoFrameCallable.nativeFunction;
+      _audioFrameCallbackPointer = _audioFrameCallable.nativeFunction;
+      _progressCallbackPointer = _progressCallable.nativeFunction;
+
+      _callbacksInitialized = true;
+    }
+
     _isInitialized = true;
+  }
+  
+  /// Register this decoder instance.
+  void _register() {
+    _FfmpegDecoderRegistry._register(this);
   }
 
   /// Opens a media file.
@@ -40,7 +94,7 @@ class FfmpegDecoder {
   /// Returns [true] if the file was opened successfully.
   Future<bool> openMedia(String filePath) async {
     if (!_isInitialized) {
-      await _initialize();
+      _initialize();
     }
 
     // Close any previously opened media
@@ -55,7 +109,6 @@ class FfmpegDecoder {
     if (result == 0) {
       _isOpened = true;
       _loadMediaInfo();
-      _currentFrameIndex = 0;
       return true;
     }
 
@@ -102,208 +155,309 @@ class FfmpegDecoder {
   /// Returns whether the media file has audio.
   bool get hasAudio => _audioSampleRate > 0 && _audioChannels > 0;
 
-  /// Returns the current frame index.
-  int get currentFrameIndex => _currentFrameIndex;
-
-  /// Retrieves a specific frame by its index.
+  /// Retrieves a specific frame by its index (ASYNC with callback).
   ///
-  /// Returns a [MediaFrame] containing both video and audio data if available,
-  /// or null if retrieval failed.
-  /// The frame is automatically cached in memory - remember to free it.
-  Future<MediaFrame?> getFrameAtIndex(int index) async {
-    if (!_isOpened || index < 0) return null;
-
-    // Get video frame
-    final videoFramePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
-    VideoFrame? videoFrame;
-
-    try {
-      final videoResult = _bindings.getVideoFrameAtIndex(index, videoFramePtrPtr);
-      if (videoResult >= 0 && videoFramePtrPtr.value != nullptr) {
-        videoFrame = _convertAndFreeVideoFrame(videoFramePtrPtr.value);
-        _currentFrameIndex = index;
-      }
-    } catch (e) {
-      // Video retrieval failed
-    } finally {
-      calloc.free(videoFramePtrPtr);
+  /// This method uses native threading for optimal performance.
+  /// The callback will be invoked when the frame is ready.
+  ///
+  /// Returns a request ID that can be used to cancel the request.
+  int getFrameAtIndexAsync(int index, OnFrameCallback callback) {
+    if (!_isOpened || index < 0) {
+      callback(null);
+      return -1;
     }
 
-    // Get audio frame
-    final audioFramePtrPtr = calloc<Pointer<ffi_bindings.AudioFrame>>();
-    AudioFrame? audioFrame;
+    final callbackId = _nextCallbackId++;
+    final request = _PendingRequest(
+      callbackId: callbackId,
+      videoCallback: callback,
+      hasVideo: true,
+      hasAudio: true,
+    );
+    _pendingRequests[callbackId] = request;
 
-    try {
-      final audioResult = _bindings.getAudioFrameAtIndex(index, audioFramePtrPtr);
-      if (audioResult >= 0 && audioFramePtrPtr.value != nullptr) {
-        audioFrame = _convertAndFreeAudioFrame(audioFramePtrPtr.value);
-      }
-    } catch (e) {
-      // Audio retrieval failed
-    } finally {
-      calloc.free(audioFramePtrPtr);
+    // Create user data pointer with callback ID
+    final userData = calloc<Int64>();
+    userData.value = callbackId;
+
+    // Request video frame
+    final videoRequestId = _bindings.getVideoFrameAtIndexAsync(
+      index,
+      _videoFrameCallbackPointer,
+      userData.cast(),
+    );
+
+    if (videoRequestId < 0) {
+      calloc.free(userData);
+      _pendingRequests.remove(callbackId);
+      callback(null);
+      return -1;
     }
 
-    // Return combined frame
-    if (videoFrame != null) {
-      if (audioFrame != null) {
-        return MediaFrame.withBoth(videoFrame, audioFrame);
-      }
-      return MediaFrame.withVideo(videoFrame);
-    } else if (audioFrame != null) {
-      return MediaFrame.withAudio(audioFrame);
+    request.videoRequestId = videoRequestId;
+
+    // Request audio frame
+    final audioRequestId = _bindings.getAudioFrameAtIndexAsync(
+      index,
+      _audioFrameCallbackPointer,
+      userData.cast(),
+    );
+
+    if (audioRequestId >= 0) {
+      request.audioRequestId = audioRequestId;
     }
 
-    return null;
+    return callbackId;
   }
 
-  /// Retrieves a specific frame at the given timestamp in milliseconds.
+  /// Retrieves a specific frame at the given timestamp in milliseconds (ASYNC).
   ///
-  /// Returns a [MediaFrame] containing both video and audio data if available,
-  /// or null if retrieval failed.
-  Future<MediaFrame?> getFrameAtTimestamp(int timestampMs) async {
-    if (!_isOpened || timestampMs < 0) return null;
-
-    // Get video frame
-    final videoFramePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
-    VideoFrame? videoFrame;
-
-    try {
-      final videoResult = _bindings.getVideoFrameAtTimestamp(timestampMs, videoFramePtrPtr);
-      if (videoResult >= 0 && videoFramePtrPtr.value != nullptr) {
-        videoFrame = _convertAndFreeVideoFrame(videoFramePtrPtr.value);
-      }
-    } catch (e) {
-      // Video retrieval failed
-    } finally {
-      calloc.free(videoFramePtrPtr);
+  /// The callback will be invoked when the frame is ready.
+  ///
+  /// Returns a request ID that can be used to cancel the request.
+  int getFrameAtTimestampAsync(int timestampMs, OnFrameCallback callback) {
+    if (!_isOpened || timestampMs < 0) {
+      callback(null);
+      return -1;
     }
 
-    // Get audio frame
-    final audioFramePtrPtr = calloc<Pointer<ffi_bindings.AudioFrame>>();
-    AudioFrame? audioFrame;
+    final callbackId = _nextCallbackId++;
+    final request = _PendingRequest(
+      callbackId: callbackId,
+      videoCallback: callback,
+      hasVideo: true,
+      hasAudio: true,
+    );
+    _pendingRequests[callbackId] = request;
 
-    try {
-      final audioResult = _bindings.getAudioFrameAtTimestamp(timestampMs, audioFramePtrPtr);
-      if (audioResult >= 0 && audioFramePtrPtr.value != nullptr) {
-        audioFrame = _convertAndFreeAudioFrame(audioFramePtrPtr.value);
-      }
-    } catch (e) {
-      // Audio retrieval failed
-    } finally {
-      calloc.free(audioFramePtrPtr);
+    final userData = calloc<Int64>();
+    userData.value = callbackId;
+
+    final videoRequestId = _bindings.getVideoFrameAtTimestampAsync(
+      timestampMs,
+      _videoFrameCallbackPointer,
+      userData.cast(),
+    );
+
+    if (videoRequestId < 0) {
+      calloc.free(userData);
+      _pendingRequests.remove(callbackId);
+      callback(null);
+      return -1;
     }
 
-    // Update frame index if we have a frame
-    if (videoFrame != null && _fps > 0) {
-      _currentFrameIndex = (videoFrame.pts.inMilliseconds * _fps / 1000).round();
+    request.videoRequestId = videoRequestId;
+
+    final audioRequestId = _bindings.getAudioFrameAtTimestampAsync(
+      timestampMs,
+      _audioFrameCallbackPointer,
+      userData.cast(),
+    );
+
+    if (audioRequestId >= 0) {
+      request.audioRequestId = audioRequestId;
     }
 
-    // Return combined frame
-    if (videoFrame != null) {
-      if (audioFrame != null) {
-        return MediaFrame.withBoth(videoFrame, audioFrame);
-      }
-      return MediaFrame.withVideo(videoFrame);
-    } else if (audioFrame != null) {
-      return MediaFrame.withAudio(audioFrame);
-    }
-
-    return null;
+    return callbackId;
   }
 
-  /// Retrieves a range of frames by index.
+  /// Retrieves a range of frames by index (OPTIMIZED ASYNC).
   ///
-  /// Returns a list of [MediaFrame] objects. The list may contain fewer frames
-  /// than requested if reaching end of media or if retrieval fails.
-  Future<List<MediaFrame>> getFramesRangeByIndex(int start, int end) async {
-    final frames = <MediaFrame>[];
+  /// This method uses an optimized C implementation that seeks once
+  /// and decodes sequentially, much faster than multiple individual requests.
+  ///
+  /// [frameCallback] is called for each frame as it becomes available.
+  /// [progressCallback] is called to report progress (optional).
+  ///
+  /// Returns a request ID that can be used to cancel the request.
+  int getFramesRangeByIndexAsync(
+    int start,
+    int end,
+    OnFrameCallback frameCallback, {
+    OnProgressCallback? progressCallback,
+  }) {
+    if (!_isOpened || start < 0 || end < start) {
+      return -1;
+    }
 
-    for (int i = start; i <= end; i++) {
-      final frame = await getFrameAtIndex(i);
-      if (frame != null) {
-        frames.add(frame);
+    final callbackId = _nextCallbackId++;
+    final request = _PendingRequest(
+      callbackId: callbackId,
+      videoCallback: frameCallback,
+      progressCallback: progressCallback,
+      hasVideo: true,
+      hasAudio: false,
+      isRange: true,
+    );
+    _pendingRequests[callbackId] = request;
+
+    final userData = calloc<Int64>();
+    userData.value = callbackId;
+
+    final requestId = _bindings.getVideoFramesRangeAsync(
+      start,
+      end,
+      _videoFrameCallbackPointer,
+      progressCallback != null ? _progressCallbackPointer : nullptr,
+      userData.cast(),
+    );
+
+    if (requestId < 0) {
+      calloc.free(userData);
+      _pendingRequests.remove(callbackId);
+      return -1;
+    }
+
+    request.videoRequestId = requestId;
+
+    return callbackId;
+  }
+
+  /// Cancels an async request.
+  void cancelRequest(int requestId) {
+    final request = _pendingRequests[requestId];
+    if (request != null) {
+      if (request.videoRequestId > 0) {
+        _bindings.cancelRequest(request.videoRequestId);
+      }
+      if (request.audioRequestId > 0) {
+        _bindings.cancelRequest(request.audioRequestId);
+      }
+      _pendingRequests.remove(requestId);
+    }
+  }
+
+  // --- Native Callback Handlers ---
+
+  static void _onVideoFrameCallback(
+      Pointer<Void> userData, Pointer<ffi_bindings.VideoFrame> frame, int errorCode) {
+    if (userData == nullptr) return;
+
+    final callbackId = userData.cast<Int64>().value;
+    _FfmpegDecoderRegistry._handleVideoFrame(callbackId, frame, errorCode);
+  }
+
+  static void _onAudioFrameCallback(
+      Pointer<Void> userData, Pointer<ffi_bindings.AudioFrame> frame, int errorCode) {
+    if (userData == nullptr) return;
+
+    final callbackId = userData.cast<Int64>().value;
+    _FfmpegDecoderRegistry._handleAudioFrame(callbackId, frame, errorCode);
+  }
+
+  static void _onProgressCallback(Pointer<Void> userData, int current, int total) {
+    if (userData == nullptr) return;
+
+    final callbackId = userData.cast<Int64>().value;
+    _FfmpegDecoderRegistry._handleProgress(callbackId, current, total);
+  }
+
+  void _handleVideoFrameInternal(int callbackId, Pointer<ffi_bindings.VideoFrame> framePtr, int errorCode) {
+    final request = _pendingRequests[callbackId];
+    if (request == null) return;
+
+    if (errorCode >= 0 && framePtr != nullptr) {
+      try {
+        request.videoFrame = _convertAndFreeVideoFrame(framePtr);
+      } catch (e) {
+        request.videoFrame = null;
+      }
+    }
+
+    request.videoCompleted = true;
+    _checkAndInvokeCallback(callbackId);
+  }
+
+  void _handleAudioFrameInternal(int callbackId, Pointer<ffi_bindings.AudioFrame> framePtr, int errorCode) {
+    final request = _pendingRequests[callbackId];
+    if (request == null) return;
+
+    if (errorCode >= 0 && framePtr != nullptr) {
+      try {
+        request.audioFrame = _convertAndFreeAudioFrame(framePtr);
+      } catch (e) {
+        request.audioFrame = null;
+      }
+    }
+
+    request.audioCompleted = true;
+    _checkAndInvokeCallback(callbackId);
+  }
+
+  void _handleProgressInternal(int callbackId, int current, int total) {
+    final request = _pendingRequests[callbackId];
+    if (request == null) return;
+
+    if (request.progressCallback != null) {
+      request.progressCallback!(current, total);
+    }
+  }
+
+  void _checkAndInvokeCallback(int callbackId) {
+    final request = _pendingRequests[callbackId];
+    if (request == null) return;
+
+    // For range requests, invoke callback immediately for each frame
+    if (request.isRange) {
+      if (request.videoCompleted && request.videoFrame != null) {
+        final mediaFrame = MediaFrame.withVideo(request.videoFrame!);
+        request.videoCallback?.call(mediaFrame);
+        request.videoCompleted = false;
+        request.videoFrame = null;
+      }
+      return;
+    }
+
+    // For single requests, wait for both video and audio
+    if (!request.videoCompleted || (request.hasAudio && !request.audioCompleted)) {
+      return;
+    }
+
+    // Combine frames and invoke callback
+    MediaFrame? mediaFrame;
+    if (request.videoFrame != null) {
+      if (request.audioFrame != null) {
+        mediaFrame = MediaFrame.withBoth(request.videoFrame!, request.audioFrame!);
       } else {
-        break; // Stop if frame retrieval fails (likely EOF)
+        mediaFrame = MediaFrame.withVideo(request.videoFrame!);
       }
+    } else if (request.audioFrame != null) {
+      mediaFrame = MediaFrame.withAudio(request.audioFrame!);
     }
 
-    return frames;
-  }
-
-  /// Retrieves a range of frames by timestamp.
-  ///
-  /// Returns a list of [MediaFrame] objects. The list may contain fewer frames
-  /// than requested if reaching end of media or if retrieval fails.
-  Future<List<MediaFrame>> getFramesRangeByTimestamp(
-      int startMs, int endMs, int stepMs) async {
-    final frames = <MediaFrame>[];
-
-    for (int ts = startMs; ts <= endMs; ts += stepMs) {
-      final frame = await getFrameAtTimestamp(ts);
-      if (frame != null) {
-        frames.add(frame);
-      } else {
-        break; // Stop if frame retrieval fails (likely EOF)
-      }
-    }
-
-    return frames;
-  }
-
-  /// Moves to the next frame.
-  ///
-  /// Returns the next [MediaFrame] or null if already at the end.
-  Future<MediaFrame?> nextFrame() async {
-    if (!_isOpened) return null;
-
-    _currentFrameIndex++;
-    return await getFrameAtIndex(_currentFrameIndex);
-  }
-
-  /// Moves to the previous frame.
-  ///
-  /// Returns the previous [MediaFrame] or null if already at the beginning.
-  Future<MediaFrame?> previousFrame() async {
-    if (!_isOpened || _currentFrameIndex <= 0) return null;
-
-    _currentFrameIndex--;
-    return await getFrameAtIndex(_currentFrameIndex);
+    request.videoCallback?.call(mediaFrame);
+    _pendingRequests.remove(callbackId);
   }
 
   /// Converts a native video frame to a Dart VideoFrame and frees the native memory.
   VideoFrame _convertAndFreeVideoFrame(Pointer<ffi_bindings.VideoFrame> framePtr) {
     final frame = framePtr.ref;
 
-    // Safety checks
     final dataSize = frame.linesize * frame.height;
-    if (dataSize <= 0 || dataSize > 100 * 1024 * 1024) { // Max 100MB
+    if (dataSize <= 0 || dataSize > 100 * 1024 * 1024) {
       throw StateError('Invalid video frame data size: $dataSize bytes');
     }
 
     final rgbaBytes = Uint8List(dataSize);
-    
-    // Check pointer validity before access
+
     if (frame.data == nullptr) {
       throw StateError('Native frame data pointer is null');
     }
 
-    // Convert to Pointer<Uint8> and copy data element by element
     final nativePtr = frame.data.cast<Uint8>();
-    
+
     try {
-      // Use a safer copy approach - read in chunks to avoid any FFI issues
       const chunkSize = 4096;
       int offset = 0;
-      
+
       while (offset < dataSize) {
         final remaining = dataSize - offset;
         final currentChunk = remaining < chunkSize ? remaining : chunkSize;
-        
+
         for (int i = 0; i < currentChunk; i++) {
           rgbaBytes[offset + i] = nativePtr[offset + i];
         }
-        
+
         offset += currentChunk;
       }
     } catch (e) {
@@ -318,7 +472,6 @@ class FfmpegDecoder {
       frameId: frame.frameId,
     );
 
-    // Free the native frame AFTER copying data
     _bindings.freeVideoFrame(framePtr);
 
     return videoFrame;
@@ -328,35 +481,31 @@ class FfmpegDecoder {
   AudioFrame _convertAndFreeAudioFrame(Pointer<ffi_bindings.AudioFrame> framePtr) {
     final frame = framePtr.ref;
 
-    // Safety checks
     final dataSize = frame.samplesCount * frame.channels;
-    if (dataSize <= 0 || dataSize > 10 * 1024 * 1024) { // Max 10M samples
+    if (dataSize <= 0 || dataSize > 10 * 1024 * 1024) {
       throw StateError('Invalid audio frame data size: $dataSize samples');
     }
 
     final samples = Float32List(dataSize);
 
-    // Check pointer validity before access
     if (frame.data == nullptr) {
       throw StateError('Native audio data pointer is null');
     }
 
-    // Convert to Pointer<Float> and copy data sample by sample
     final nativePtr = frame.data.cast<Float>();
-    
+
     try {
-      // Copy in chunks for safety
       const chunkSize = 1024;
       int offset = 0;
-      
+
       while (offset < dataSize) {
         final remaining = dataSize - offset;
         final currentChunk = remaining < chunkSize ? remaining : chunkSize;
-        
+
         for (int i = 0; i < currentChunk; i++) {
           samples[offset + i] = nativePtr[offset + i];
         }
-        
+
         offset += currentChunk;
       }
     } catch (e) {
@@ -370,7 +519,6 @@ class FfmpegDecoder {
       pts: Duration(milliseconds: frame.ptsMs),
     );
 
-    // Free the native frame AFTER copying data
     _bindings.freeAudioFrame(framePtr);
 
     return audioFrame;
@@ -378,6 +526,11 @@ class FfmpegDecoder {
 
   /// Releases all resources and closes the media file.
   Future<void> release() async {
+    // Cancel all pending requests
+    for (final callbackId in _pendingRequests.keys.toList()) {
+      cancelRequest(callbackId);
+    }
+
     if (_isOpened) {
       _bindings.stop();
       _isOpened = false;
@@ -388,11 +541,83 @@ class FfmpegDecoder {
     _videoHeight = 0;
     _fps = 0;
     _totalFrames = 0;
-    _currentFrameIndex = 0;
   }
 
   /// Cleans up the native FFmpeg resources.
   Future<void> dispose() async {
     await release();
+    _FfmpegDecoderRegistry._unregister(this);
+  }
+}
+
+/// Internal class to track pending async requests.
+class _PendingRequest {
+  final int callbackId;
+  int videoRequestId = 0;
+  int audioRequestId = 0;
+  
+  OnFrameCallback? videoCallback;
+  OnProgressCallback? progressCallback;
+  
+  bool hasVideo;
+  bool hasAudio;
+  bool isRange;
+  
+  bool videoCompleted = false;
+  bool audioCompleted = false;
+  
+  VideoFrame? videoFrame;
+  AudioFrame? audioFrame;
+
+  _PendingRequest({
+    required this.callbackId,
+    this.videoCallback,
+    this.progressCallback,
+    this.hasVideo = false,
+    this.hasAudio = false,
+    this.isRange = false,
+  });
+}
+
+/// Global registry to manage decoder instances and route callbacks.
+class _FfmpegDecoderRegistry {
+  static final Map<int, FfmpegDecoder> _decoders = {};
+  static int _nextId = 1;
+
+  static void _register(FfmpegDecoder decoder) {
+    final id = _nextId++;
+    _decoders[id] = decoder;
+  }
+
+  static void _unregister(FfmpegDecoder decoder) {
+    _decoders.removeWhere((key, value) => value == decoder);
+  }
+
+  static void _handleVideoFrame(int callbackId, Pointer<ffi_bindings.VideoFrame> frame, int errorCode) {
+    // Find the decoder that has this callback ID
+    for (final decoder in _decoders.values) {
+      if (decoder._pendingRequests.containsKey(callbackId)) {
+        decoder._handleVideoFrameInternal(callbackId, frame, errorCode);
+        break;
+      }
+    }
+  }
+
+  static void _handleAudioFrame(int callbackId, Pointer<ffi_bindings.AudioFrame> frame, int errorCode) {
+    for (final decoder in _decoders.values) {
+      if (decoder._pendingRequests.containsKey(callbackId)) {
+        decoder._handleAudioFrameInternal(callbackId, frame, errorCode);
+        break;
+      }
+    }
+  }
+
+  static void _handleProgress(int callbackId, int current, int total) {
+    for (final decoder in _decoders.values) {
+      if (decoder._pendingRequests.containsKey(callbackId)) {
+        decoder._handleProgressInternal(callbackId, current, total);
+        break;
+      }
+    }
   }
 }
