@@ -32,3 +32,7 @@
 * Updated example app with play/pause functionality and optimized playback mode.
 * Added frame scrubbing with slider control in example app.
 * Maintained backward compatibility with existing synchronous API.
+
+## 0.3.1
+
+* Fix Warnings

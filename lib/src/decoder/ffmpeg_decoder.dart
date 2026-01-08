@@ -1,5 +1,4 @@
 import 'dart:ffi';
-import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import '../ffi/lotterwise_ffmpeg_bindings.dart' as ffi_bindings;
