@@ -16,23 +16,18 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  FfmpegDecoder? _decoder;
-  MediaInfo? _mediaInfo;
+  final FFmpegService _service = FFmpegService();
+  VideoMetadata? _metadata;
   ui.Image? _currentFrame;
   int _currentFrameIndex = 0;
   bool _isLoading = false;
   bool _isPlaying = false;
-  bool _isPlayingOptimized = false;
   Timer? _playTimer;
-  int? _currentRequestId;
-  int? _rangeRequestId;
-  final List<VideoFrame> _frameBuffer = [];
-  int _bufferPlayIndex = 0;
 
   @override
   void dispose() {
     _playTimer?.cancel();
-    _decoder?.dispose();
+    _service.release();
     super.dispose();
   }
 
@@ -47,21 +42,18 @@ class _MyAppState extends State<MyApp> {
   Future<void> _openMedia(String path) async {
     // Stop playing if playing
     _stopPlaying();
-    _stopPlayingOptimized();
 
-    // Cleanup previous
-    await _decoder?.release();
     setState(() {
-      _mediaInfo = null;
+      _metadata = null;
       _currentFrame = null;
       _currentFrameIndex = 0;
     });
 
     try {
-      final decoder = FfmpegDecoder();
-      final success = await decoder.openMedia(path);
+      // Open video with FFmpegService (batch system is automatic)
+      final metadata = await _service.openVideo(path);
 
-      if (!success) {
+      if (metadata == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Failed to open media file')),
@@ -71,12 +63,11 @@ class _MyAppState extends State<MyApp> {
       }
 
       setState(() {
-        _decoder = decoder;
-        _mediaInfo = _createMediaInfo(decoder);
+        _metadata = metadata;
       });
 
-      // Get first frame async
-      _getFrameAsync(0);
+      // Get first frame
+      await _loadFrame(0);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -86,93 +77,50 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  MediaInfo _createMediaInfo(FfmpegDecoder decoder) {
-    return MediaInfo(
-      width: decoder.videoWidth,
-      height: decoder.videoHeight,
-      fps: decoder.fps,
-      duration: Duration(milliseconds: decoder.durationMs),
-      totalFrames: decoder.totalFrames,
-      audioSampleRate: decoder.audioSampleRate,
-      audioChannels: decoder.audioChannels,
-    );
-  }
+  Future<void> _loadFrame(int frameIndex) async {
+    if (_metadata == null) return;
 
-  void _getFrameAsync(int frameIndex) {
-    if (_decoder == null || _mediaInfo == null) return;
-    
     // Clamp frame index
-    if (frameIndex < 0) frameIndex = 0;
-    if (frameIndex >= _mediaInfo!.totalFrames) {
-      frameIndex = _mediaInfo!.totalFrames - 1;
-      if (_isPlaying) {
-        _stopPlaying();
-      }
-    }
-
-    // Cancel previous request if any
-    if (_currentRequestId != null) {
-      _decoder!.cancelRequest(_currentRequestId!);
-    }
+    frameIndex = frameIndex.clamp(0, _metadata!.totalFrames - 1);
 
     setState(() {
       _isLoading = true;
     });
 
-    final requestedFrameIndex = frameIndex; // Capture the requested index
-    
-    print('Requesting frame $requestedFrameIndex'); // Debug
-    
-    _currentRequestId = _decoder!.getFrameAtIndexAsync(frameIndex, (frame) async {
-      _currentRequestId = null;
-      
-      print('Received frame for request $requestedFrameIndex: ${frame != null}'); // Debug
-      
-      if (frame?.video != null) {
-        await _renderFrame(frame!.video!, requestedFrameIndex);
-      } else {
-        print('WARNING: No video frame received for index $requestedFrameIndex');
-      }
+    try {
+      // Get frame using FFmpegService (uses batch manager automatically)
+      final frameData = await _service.getFrameAtIndex(frameIndex);
 
-      if (mounted) {
+      if (frameData != null && mounted) {
+        // Convert to Flutter image
+        final image = await FFmpegService.convertToFlutterImage(frameData);
+
+        setState(() {
+          _currentFrame = image;
+          _currentFrameIndex = frameIndex;
+          _isLoading = false;
+        });
+      } else {
         setState(() {
           _isLoading = false;
         });
       }
-    });
-  }
-
-  Future<void> _renderFrame(VideoFrame frame, int requestedFrameIndex) async {
-    final completer = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-      frame.rgbaBytes,
-      frame.width,
-      frame.height,
-      ui.PixelFormat.rgba8888,
-      (image) {
-        completer.complete(image);
-      },
-    );
-    final image = await completer.future;
-
-    if (mounted) {
+    } catch (e) {
+      print('Error loading frame: $e');
       setState(() {
-        _currentFrame = image;
-        // Use the requested frame index instead of frame.frameId which might be unreliable
-        _currentFrameIndex = requestedFrameIndex;
+        _isLoading = false;
       });
     }
   }
 
   void _goToPreviousFrame() {
-    if (_decoder == null || _currentFrameIndex <= 0) return;
-    _getFrameAsync(_currentFrameIndex - 1);
+    if (_currentFrameIndex <= 0) return;
+    _loadFrame(_currentFrameIndex - 1);
   }
 
   void _goToNextFrame() {
-    if (_decoder == null || _mediaInfo == null) return;
-    if (_currentFrameIndex >= _mediaInfo!.totalFrames - 1) return;
-    _getFrameAsync(_currentFrameIndex + 1);
+    if (_metadata == null || _currentFrameIndex >= _metadata!.totalFrames - 1) return;
+    _loadFrame(_currentFrameIndex + 1);
   }
 
   void _togglePlayPause() {
@@ -184,17 +132,17 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _startPlaying() {
-    if (_decoder == null || _mediaInfo == null || _isPlaying) return;
+    if (_metadata == null || _isPlaying) return;
 
     setState(() {
       _isPlaying = true;
     });
 
     // Calculate frame duration based on FPS
-    final frameDurationMs = (1000 / _mediaInfo!.fps).round();
+    final frameDurationMs = (1000 / _metadata!.fps).round();
 
     _playTimer = Timer.periodic(Duration(milliseconds: frameDurationMs), (timer) {
-      if (!_isPlaying || _decoder == null || _mediaInfo == null) {
+      if (!_isPlaying || _metadata == null) {
         timer.cancel();
         return;
       }
@@ -206,14 +154,14 @@ class _MyAppState extends State<MyApp> {
 
       // Go to next frame
       final nextFrame = _currentFrameIndex + 1;
-      
-      if (nextFrame >= _mediaInfo!.totalFrames) {
+
+      if (nextFrame >= _metadata!.totalFrames) {
         // End of video, stop playing
         _stopPlaying();
         return;
       }
 
-      _getFrameAsync(nextFrame);
+      _loadFrame(nextFrame);
     });
   }
 
@@ -228,168 +176,32 @@ class _MyAppState extends State<MyApp> {
     _playTimer = null;
   }
 
-  // ==================== OPTIMIZED PLAY MODE ====================
-
-  void _togglePlayPauseOptimized() {
-    if (_isPlayingOptimized) {
-      _stopPlayingOptimized();
-    } else {
-      _startPlayingOptimized();
-    }
-  }
-
-  void _startPlayingOptimized() {
-    if (_decoder == null || _mediaInfo == null || _isPlayingOptimized) return;
-
-    // Stop normal play if active
-    if (_isPlaying) {
-      _stopPlaying();
-    }
-
-    setState(() {
-      _isPlayingOptimized = true;
-      _frameBuffer.clear();
-      _bufferPlayIndex = 0;
-    });
-
-    print('🚀 Starting optimized play from frame $_currentFrameIndex');
-
-    // Load frames in batches
-    _loadNextBatch();
-  }
-
-  void _loadNextBatch() {
-    if (!_isPlayingOptimized || _decoder == null || _mediaInfo == null) return;
-
-    final batchSize = 30; // Load 30 frames at a time
-    final startFrame = _currentFrameIndex;
-    final endFrame = (startFrame + batchSize - 1).clamp(0, _mediaInfo!.totalFrames - 1);
-
-    if (startFrame >= _mediaInfo!.totalFrames) {
-      _stopPlayingOptimized();
-      return;
-    }
-
-    print('📦 Loading batch: frames $startFrame to $endFrame');
-
-    _rangeRequestId = _decoder!.getFramesRangeByIndexAsync(
-      startFrame,
-      endFrame,
-      (frame) {
-        // This callback is called for EACH frame as it's decoded
-        if (!_isPlayingOptimized) return;
-
-        if (frame?.video != null) {
-          _frameBuffer.add(frame!.video!);
-          
-          // Start playing from buffer if we have enough frames
-          if (_frameBuffer.isNotEmpty && _playTimer == null) {
-            _startBufferPlayback();
-          }
-        }
-      },
-      progressCallback: (current, total) {
-        print('📊 Progress: $current/$total frames loaded');
-      },
-    );
-  }
-
-  void _startBufferPlayback() {
-    if (_playTimer != null) return;
-
-    // Calculate frame duration based on FPS
-    final frameDurationMs = (1000 / _mediaInfo!.fps).round();
-
-    _playTimer = Timer.periodic(Duration(milliseconds: frameDurationMs), (timer) {
-      if (!_isPlayingOptimized) {
-        timer.cancel();
-        _playTimer = null;
-        return;
-      }
-
-      // Display next frame from buffer
-      if (_bufferPlayIndex < _frameBuffer.length) {
-        final frame = _frameBuffer[_bufferPlayIndex];
-        _renderFrameSync(frame, _currentFrameIndex);
-        _bufferPlayIndex++;
-        _currentFrameIndex++;
-
-        // Check if we're near the end of buffer - load next batch
-        if (_bufferPlayIndex >= _frameBuffer.length - 5 && _currentFrameIndex < _mediaInfo!.totalFrames) {
-          print('🔄 Buffer running low, loading next batch...');
-          _frameBuffer.clear();
-          _bufferPlayIndex = 0;
-          _loadNextBatch();
-        }
-      } else if (_currentFrameIndex >= _mediaInfo!.totalFrames) {
-        // End of video
-        _stopPlayingOptimized();
-      }
-    });
-  }
-
-  void _renderFrameSync(VideoFrame frame, int frameIndex) {
-    // Synchronous version for buffer playback
-    ui.decodeImageFromPixels(
-      frame.rgbaBytes,
-      frame.width,
-      frame.height,
-      ui.PixelFormat.rgba8888,
-      (image) {
-        if (mounted) {
-          setState(() {
-            _currentFrame = image;
-            _currentFrameIndex = frameIndex;
-          });
-        }
-      },
-    );
-  }
-
-  void _stopPlayingOptimized() {
-    if (!_isPlayingOptimized) return;
-
-    print('⏹️ Stopping optimized play');
-
-    setState(() {
-      _isPlayingOptimized = false;
-    });
-
-    _playTimer?.cancel();
-    _playTimer = null;
-
-    if (_rangeRequestId != null) {
-      _decoder?.cancelRequest(_rangeRequestId!);
-      _rangeRequestId = null;
-    }
-
-    _frameBuffer.clear();
-    _bufferPlayIndex = 0;
-  }
-
   @override
   Widget build(BuildContext context) {
+    // Get cache stats for display
+    final cacheStats = _service.getCacheStats();
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('FFmpeg Streamer'),
+        title: const Text('FFmpeg Streamer Example'),
         backgroundColor: Colors.deepPurple,
       ),
       body: Column(
         children: [
-          if (_mediaInfo != null)
+          if (_metadata != null)
             Container(
               padding: const EdgeInsets.all(16.0),
               color: Colors.deepPurple.shade50,
               child: Column(
                 children: [
                   Text(
-                    '${_mediaInfo!.width}x${_mediaInfo!.height} @ ${_mediaInfo!.fps.toStringAsFixed(2)} fps',
+                    '${_metadata!.width}x${_metadata!.height} @ ${_metadata!.fps.toStringAsFixed(2)} fps',
                     style: const TextStyle(
                         fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Duration: ${_mediaInfo!.duration} | Total frames: ${_mediaInfo!.totalFrames}',
+                    'Total frames: ${_metadata!.totalFrames} | Duration: ${(_metadata!.durationMs / 1000).toStringAsFixed(1)}s',
                     style: const TextStyle(fontSize: 14),
                   ),
                   const SizedBox(height: 4),
@@ -397,8 +209,8 @@ class _MyAppState extends State<MyApp> {
                     'Current frame: $_currentFrameIndex',
                     style: TextStyle(
                       fontSize: 14,
-                      color: _isPlaying || _isPlayingOptimized ? Colors.green : Colors.blue,
-                      fontWeight: _isPlaying || _isPlayingOptimized ? FontWeight.bold : FontWeight.normal,
+                      color: _isPlaying ? Colors.green : Colors.blue,
+                      fontWeight: _isPlaying ? FontWeight.bold : FontWeight.normal,
                     ),
                   ),
                   if (_isPlaying)
@@ -410,7 +222,7 @@ class _MyAppState extends State<MyApp> {
                           Icon(Icons.play_arrow, size: 16, color: Colors.green),
                           SizedBox(width: 4),
                           Text(
-                            'PLAYING (Normal)',
+                            'PLAYING',
                             style: TextStyle(
                               fontSize: 12,
                               color: Colors.green,
@@ -420,23 +232,15 @@ class _MyAppState extends State<MyApp> {
                         ],
                       ),
                     ),
-                  if (_isPlayingOptimized)
+                  if (cacheStats != null)
                     Padding(
-                      padding: const EdgeInsets.only(top: 4.0),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(Icons.flash_on, size: 16, color: Colors.orange),
-                          const SizedBox(width: 4),
-                          Text(
-                            'PLAYING (Optimized) - Buffer: ${_frameBuffer.length} frames',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: Colors.orange,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Text(
+                        '📦 Cache: ${cacheStats.cachedBatches} batches, ${cacheStats.totalFramesInCache} frames (${cacheStats.memoryUsageMB.toStringAsFixed(1)} MB)',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.black54,
+                        ),
                       ),
                     ),
                 ],
@@ -448,7 +252,7 @@ class _MyAppState extends State<MyApp> {
                   ? const CircularProgressIndicator()
                   : _currentFrame != null
                       ? AspectRatio(
-                          aspectRatio: _mediaInfo!.width / _mediaInfo!.height,
+                          aspectRatio: _metadata!.width / _metadata!.height,
                           child: CustomPaint(
                             painter: VideoPainter(_currentFrame!),
                           ),
@@ -459,9 +263,9 @@ class _MyAppState extends State<MyApp> {
                         ),
             ),
           ),
-          
+
           // Slider for scrubbing
-          if (_mediaInfo != null && _currentFrame != null)
+          if (_metadata != null && _currentFrame != null)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0),
               child: Column(
@@ -469,33 +273,30 @@ class _MyAppState extends State<MyApp> {
                   Slider(
                     value: _currentFrameIndex.toDouble(),
                     min: 0,
-                    max: (_mediaInfo!.totalFrames - 1).toDouble(),
-                    divisions: _mediaInfo!.totalFrames > 1 ? _mediaInfo!.totalFrames - 1 : 1,
+                    max: (_metadata!.totalFrames - 1).toDouble(),
+                    divisions: _metadata!.totalFrames > 1 ? _metadata!.totalFrames - 1 : 1,
                     label: 'Frame $_currentFrameIndex',
                     onChanged: (value) {
                       if (_isPlaying) {
                         _stopPlaying();
                       }
-                      if (_isPlayingOptimized) {
-                        _stopPlayingOptimized();
-                      }
-                      _getFrameAsync(value.toInt());
+                      _loadFrame(value.toInt());
                     },
                   ),
                   Text(
-                    'Frame $_currentFrameIndex / ${_mediaInfo!.totalFrames - 1}',
+                    'Frame $_currentFrameIndex / ${_metadata!.totalFrames - 1}',
                     style: const TextStyle(fontSize: 12, color: Colors.grey),
                   ),
                 ],
               ),
             ),
-          
+
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Column(
               children: [
                 // Frame index input
-                if (_mediaInfo != null)
+                if (_metadata != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 12.0),
                     child: Row(
@@ -508,7 +309,7 @@ class _MyAppState extends State<MyApp> {
                             decoration: InputDecoration(
                               labelText: 'Go to frame',
                               border: const OutlineInputBorder(),
-                              hintText: '0-${_mediaInfo!.totalFrames - 1}',
+                              hintText: '0-${_metadata!.totalFrames - 1}',
                               contentPadding: const EdgeInsets.all(8),
                             ),
                             onSubmitted: (value) {
@@ -517,7 +318,7 @@ class _MyAppState extends State<MyApp> {
                                 if (_isPlaying) {
                                   _stopPlaying();
                                 }
-                                _getFrameAsync(frameIndex);
+                                _loadFrame(frameIndex);
                               }
                             },
                           ),
@@ -529,9 +330,9 @@ class _MyAppState extends State<MyApp> {
                             }
                             final randomIndex =
                                 (DateTime.now().millisecondsSinceEpoch %
-                                        _mediaInfo!.totalFrames)
+                                        _metadata!.totalFrames)
                                     .toInt();
-                            _getFrameAsync(randomIndex);
+                            _loadFrame(randomIndex);
                           },
                           icon: const Icon(Icons.shuffle, size: 18),
                           label: const Text('Random'),
@@ -539,41 +340,22 @@ class _MyAppState extends State<MyApp> {
                       ],
                     ),
                   ),
-                // Play/Pause buttons
-                if (_decoder != null)
+                // Play/Pause button
+                if (_metadata != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 8.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        ElevatedButton.icon(
-                          onPressed: _togglePlayPause,
-                          icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
-                          label: Text(_isPlaying ? 'Pause' : 'Play'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _isPlaying ? Colors.orange : Colors.green,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 24,
-                              vertical: 12,
-                            ),
-                          ),
+                    child: ElevatedButton.icon(
+                      onPressed: _togglePlayPause,
+                      icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
+                      label: Text(_isPlaying ? 'Pause' : 'Play'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _isPlaying ? Colors.orange : Colors.green,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 32,
+                          vertical: 14,
                         ),
-                        const SizedBox(width: 12),
-                        ElevatedButton.icon(
-                          onPressed: _togglePlayPauseOptimized,
-                          icon: Icon(_isPlayingOptimized ? Icons.pause : Icons.flash_on),
-                          label: Text(_isPlayingOptimized ? 'Pause' : 'Play ⚡'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _isPlayingOptimized ? Colors.deepOrange : Colors.deepPurple,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 24,
-                              vertical: 12,
-                            ),
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                 // Navigation buttons
@@ -585,14 +367,14 @@ class _MyAppState extends State<MyApp> {
                       icon: const Icon(Icons.folder_open),
                       label: const Text('Pick File'),
                     ),
-                    if (_decoder != null) ...[
+                    if (_metadata != null) ...[
                       ElevatedButton.icon(
-                        onPressed: (_isPlaying || _isPlayingOptimized) ? null : _goToPreviousFrame,
+                        onPressed: _isPlaying ? null : _goToPreviousFrame,
                         icon: const Icon(Icons.skip_previous),
                         label: const Text('Prev'),
                       ),
                       ElevatedButton.icon(
-                        onPressed: (_isPlaying || _isPlayingOptimized) ? null : _goToNextFrame,
+                        onPressed: _isPlaying ? null : _goToNextFrame,
                         icon: const Icon(Icons.skip_next),
                         label: const Text('Next'),
                       ),

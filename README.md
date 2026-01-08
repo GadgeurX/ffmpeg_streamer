@@ -1,10 +1,18 @@
 # ffmpeg_streamer
 
-A **high-performance** Flutter plugin for using FFmpeg to decode video and audio frames via FFI. Now with **asynchronous API and native threading** for 7-10x faster batch operations!
+A **high-performance** Flutter plugin for using FFmpeg to decode video and audio frames via FFI. Now with **intelligent batch management** and a simplified high-level API!
 
 ## ✨ Features
 
-### Version 2.0 - New!
+### Version 0.4.0 - New! 🎉
+- 🎯 **FFmpegService**: Simplified high-level API - no more manual decoder management
+- 🧠 **Intelligent Batch Manager**: Automatic frame caching with smart preloading
+- 📦 **7 Preset Configurations**: Optimized for different use cases (4K, editing, scrubbing, etc.)
+- 🔧 **Auto-Configuration**: Automatically selects optimal settings based on video resolution
+- 📊 **Real-time Cache Stats**: Monitor batches, frames, and memory usage
+- 🎨 **35% Less Code**: Simplified example app demonstrates ease of use
+
+### Version 0.3.0 Features
 - 🚀 **Async API with Callbacks**: Non-blocking frame retrieval with native threading
 - ⚡ **Ultra-Fast Batch Processing**: 87% faster for 100 frames (15s → 2s)
 - 🧵 **Native Threading (pthread)**: Dedicated worker thread, zero UI blocking
@@ -15,7 +23,7 @@ A **high-performance** Flutter plugin for using FFmpeg to decode video and audio
 - 🎥 **Video Decoding**: Access raw RGBA video frames
 - 🔊 **Audio Decoding**: Access raw Float32 audio samples
 - 📱 **Cross-Platform**: Android, iOS, macOS, Windows, Linux
-- 🔙 **Backward Compatible**: Old sync API still works
+- 🔙 **Backward Compatible**: All previous APIs still work
 
 ## Prerequisites & Setup
 
@@ -54,7 +62,103 @@ A **high-performance** Flutter plugin for using FFmpeg to decode video and audio
 
 ## 🚀 Quick Start
 
-### Basic Usage (Sync API)
+### 🌟 Recommended: High-Level API with FFmpegService
+
+The easiest way to use ffmpeg_streamer with automatic batch management:
+
+```dart
+import 'package:ffmpeg_streamer/ffmpeg_streamer.dart';
+
+void main() async {
+  // Create service instance
+  final service = FFmpegService();
+  
+  // Open video (batch manager is initialized automatically)
+  final metadata = await service.openVideo('path/to/video.mp4');
+  
+  // Get video info
+  print('Resolution: ${metadata!.width}x${metadata.height}');
+  print('FPS: ${metadata.fps}');
+  print('Total frames: ${metadata.totalFrames}');
+  
+  // Get a frame (uses intelligent batch caching automatically)
+  final frameData = await service.getFrameAtIndex(42);
+  if (frameData != null) {
+    // Convert to Flutter image
+    final image = await FFmpegService.convertToFlutterImage(frameData);
+    displayImage(image);
+  }
+  
+  // Check cache stats
+  final stats = service.getCacheStats();
+  print('Cache: ${stats?.cachedBatches} batches, ${stats?.totalFramesInCache} frames');
+  
+  // Cleanup
+  await service.release();
+}
+```
+
+### Advanced: Custom Batch Configuration
+
+```dart
+import 'package:ffmpeg_streamer/ffmpeg_streamer.dart';
+
+void main() async {
+  final service = FFmpegService();
+  
+  // Open with custom configuration for 4K video
+  final metadata = await service.openVideo(
+    'path/to/4k_video.mp4',
+    batchConfig: BatchConfigPresets.video4K,
+  );
+  
+  // Or use automatic configuration based on resolution
+  final recommendedConfig = BatchConfigPresets.getRecommendedConfig(
+    width: metadata!.width,
+    height: metadata.height,
+    totalFrames: metadata.totalFrames,
+    availableMemoryMB: 2048,
+  );
+  
+  // Preload a range for smooth playback
+  await service.preloadFrameRange(0, 100);
+  
+  // Get frames with zero latency (already cached!)
+  for (int i = 0; i < 100; i++) {
+    final frame = await service.getFrameAtIndex(i);
+    displayFrame(frame);
+  }
+}
+```
+
+### Available Batch Presets
+
+```dart
+// Standard - Balanced for most use cases (~1.25 GB for 1080p)
+BatchConfigPresets.standard
+
+// High Performance - Smooth playback (~2.5 GB for 1080p)
+BatchConfigPresets.highPerformance
+
+// Memory Efficient - Limited devices (~375 MB for 1080p)
+BatchConfigPresets.memoryEfficient
+
+// 4K Optimized - Large frames (~1.5 GB for 4K)
+BatchConfigPresets.video4K
+
+// Scrubbing - Timeline navigation (~2 GB for 1080p)
+BatchConfigPresets.scrubbing
+
+// Editing - Workflow optimized (~1.5 GB for 1080p)
+BatchConfigPresets.editing
+
+// Slow Motion - Frame analysis (~1 GB for 1080p)
+BatchConfigPresets.slowMotion
+```
+
+### Low-Level API: Direct Decoder Access
+
+For advanced users who need fine-grained control:
 
 ```dart
 import 'package:ffmpeg_streamer/ffmpeg_streamer.dart';
@@ -132,29 +236,74 @@ decoder.getFramesRangeByIndexAsync(0, 99,
 );
 ```
 
-### 🎬 Real-World Example: Thumbnail Generator
+### 🎬 Real-World Example: Video Player with Smooth Playback
 
 ```dart
-void generateThumbnails(String videoPath, int count) async {
-  final decoder = FfmpegDecoder();
-  await decoder.openMedia(videoPath);
+class VideoPlayer {
+  final FFmpegService _service = FFmpegService();
+  VideoMetadata? _metadata;
+  Timer? _playTimer;
+  int _currentFrame = 0;
   
-  final thumbnails = <Image>[];
-  final step = decoder.totalFrames ~/ count;
+  Future<void> openVideo(String path) async {
+    // Open with high performance preset for smooth playback
+    _metadata = await _service.openVideo(
+      path,
+      batchConfig: BatchConfigPresets.highPerformance,
+    );
+    
+    // Preload first batch for instant start
+    await _service.preloadFrameRange(0, 90);
+  }
   
-  decoder.getFramesRangeByIndexAsync(
-    0,
-    (count - 1) * step,
-    (frame) async {
-      if (frame?.video != null) {
-        final image = await frameToImage(frame!.video!);
-        thumbnails.add(image);
+  Future<void> play() async {
+    final fps = _metadata!.fps;
+    final frameDuration = Duration(milliseconds: (1000 / fps).round());
+    
+    _playTimer = Timer.periodic(frameDuration, (_) async {
+      // Get frame (instant access from cache!)
+      final frameData = await _service.getFrameAtIndex(_currentFrame);
+      if (frameData != null) {
+        final image = await FFmpegService.convertToFlutterImage(frameData);
+        displayImage(image);
       }
-    },
-    progressCallback: (current, total) {
-      updateProgressBar(current / total);
-    },
-  );
+      
+      _currentFrame++;
+      
+      // Check cache stats
+      final stats = _service.getCacheStats();
+      print('Playing: frame $_currentFrame, cache: ${stats?.totalFramesInCache} frames');
+    });
+  }
+  
+  void dispose() {
+    _playTimer?.cancel();
+    _service.release();
+  }
+}
+```
+
+### 🖼️ Real-World Example: Timeline Thumbnails
+
+```dart
+Future<List<ui.Image>> generateTimelineThumbnails(String videoPath) async {
+  final service = FFmpegService();
+  
+  // Open with scrubbing preset (optimized for random access)
+  await service.openVideo(videoPath, batchConfig: BatchConfigPresets.scrubbing);
+  
+  // Generate thumbnails is built-in!
+  final thumbnails = await service.generateTimelineThumbnails(thumbnailCount: 30);
+  
+  // Convert to Flutter images
+  final images = <ui.Image>[];
+  for (final thumbnail in thumbnails) {
+    final image = await FFmpegService.convertToFlutterImage(thumbnail);
+    images.add(image);
+  }
+  
+  await service.release();
+  return images;
 }
 ```
 
