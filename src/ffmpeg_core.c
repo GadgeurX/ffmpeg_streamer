@@ -3,100 +3,37 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
-#include <libavutil/time.h>
-#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <unistd.h>
+#include <libswresample/swresample.h>
+#include <stdlib.h>
+#include <string.h>
 
-// --- Internal State ---
-
-typedef struct {
-  AVFormatContext *fmt_ctx;
-
-  // Video
-  int video_stream_idx;
-  AVCodecContext *video_codec_ctx;
-  struct SwsContext *sws_ctx;
-  AVFrame *video_frame;
-  AVFrame *video_frame_rgba;
-  uint8_t *video_buffer;
-
-  // Audio
-  int audio_stream_idx;
-  AVCodecContext *audio_codec_ctx;
-  struct SwrContext *swr_ctx;
-  AVFrame *audio_frame;
-  AVFrame *audio_frame_converted;
-
-  // Threading control
-  pthread_t decode_thread;
-  bool is_running;
-  bool is_paused;
-  bool is_eof;
-  bool should_exit;
-  pthread_mutex_t mutex;
-
-  // Callbacks
-  OnVideoFrameCallback on_video;
-  OnAudioFrameCallback on_audio;
-  OnLogCallback on_log;
-
-  // Work packet for decoding loop (reuse to avoid allocation churn)
-  AVPacket *work_packet;
-
-} FfmpegState;
-
-static FfmpegState g_state = {0};
-
-// --- Helper Functions ---
-
-static void log_msg(int level, const char *fmt, ...) {
-  if (g_state.on_log) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-    g_state.on_log(level, buffer);
-  }
-}
-
-// --- Declaration of internal thread function
-void *decoding_loop(void *arg);
-
-// --- API Implementation ---
+static FFmpegState g_state = {0};
 
 void ffmpeg_init(void) {
-  // av_register_all() is deprecated/removed in newer FFmpeg versions.
-  // network_init() might be needed for network streams.
-  avformat_network_init();
-  pthread_mutex_init(&g_state.mutex, NULL);
-  log_msg(2, "FFmpeg Core Initialized");
+  g_state.video_stream_idx = -1;
+  g_state.audio_stream_idx = -1;
+  g_state.is_initialized = 1;
 }
 
-void ffmpeg_release(void) {
-  ffmpeg_stop();
-  avformat_network_deinit();
-  pthread_mutex_destroy(&g_state.mutex);
-  log_msg(2, "FFmpeg Core Released");
-}
+int ffmpeg_open_media(const char *file_path) {
+  if (!file_path)
+    return -1;
 
-int ffmpeg_open_media(const char *url) {
+  // Clean up any previous state
   if (g_state.fmt_ctx) {
     ffmpeg_stop();
   }
 
-  // 1. Open Input
-  if (avformat_open_input(&g_state.fmt_ctx, url, NULL, NULL) != 0) {
-    log_msg(0, "Failed to open input input: %s", url);
-    return -1;
+  // 1. Open Input File
+  if (avformat_open_input(&g_state.fmt_ctx, file_path, NULL, NULL) != 0) {
+    return -2;
   }
 
-  // 2. Find Stream Info
+  // 2. Get Stream Info
   if (avformat_find_stream_info(g_state.fmt_ctx, NULL) < 0) {
-    log_msg(0, "Failed to find stream info");
+    avformat_close_input(&g_state.fmt_ctx);
+    g_state.fmt_ctx = NULL;
     return -2;
   }
 
@@ -116,56 +53,180 @@ int ffmpeg_open_media(const char *url) {
         g_state.video_stream_idx == -1) {
       g_state.video_stream_idx = i;
       g_state.video_codec_ctx = avcodec_alloc_context3(codec);
-      avcodec_parameters_to_context(g_state.video_codec_ctx, codec_par);
+      if (!g_state.video_codec_ctx) {
+        avformat_close_input(&g_state.fmt_ctx);
+        g_state.fmt_ctx = NULL;
+        return -3;
+      }
+      if (avcodec_parameters_to_context(g_state.video_codec_ctx, codec_par) < 0) {
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
+        continue;
+      }
       if (avcodec_open2(g_state.video_codec_ctx, codec, NULL) < 0) {
-        log_msg(0, "Failed to open video codec");
-      } else {
-        // Initialize scaler for RGBA conversion
-        g_state.video_frame = av_frame_alloc();
-        g_state.video_frame_rgba = av_frame_alloc();
+        // Failed to open video codec
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
+        continue;
+      }
 
-        int num_bytes = av_image_get_buffer_size(
-            AV_PIX_FMT_RGBA, g_state.video_codec_ctx->width,
-            g_state.video_codec_ctx->height, 1);
-        g_state.video_buffer =
-            (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
+      // Initialize scaler for RGBA conversion
+      g_state.video_frame = av_frame_alloc();
+      g_state.video_frame_rgba = av_frame_alloc();
 
-        av_image_fill_arrays(
-            g_state.video_frame_rgba->data, g_state.video_frame_rgba->linesize,
-            g_state.video_buffer, AV_PIX_FMT_RGBA,
-            g_state.video_codec_ctx->width, g_state.video_codec_ctx->height, 1);
+      if (!g_state.video_frame || !g_state.video_frame_rgba) {
+        // Failed to allocate frames
+        if (g_state.video_frame) av_frame_free(&g_state.video_frame);
+        if (g_state.video_frame_rgba) av_frame_free(&g_state.video_frame_rgba);
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
+        continue;
+      }
 
-        g_state.sws_ctx = sws_getContext(
-            g_state.video_codec_ctx->width, g_state.video_codec_ctx->height,
-            g_state.video_codec_ctx->pix_fmt, g_state.video_codec_ctx->width,
-            g_state.video_codec_ctx->height, AV_PIX_FMT_RGBA, SWS_BILINEAR,
-            NULL, NULL, NULL);
+      int num_bytes = av_image_get_buffer_size(
+          AV_PIX_FMT_RGBA, g_state.video_codec_ctx->width,
+          g_state.video_codec_ctx->height, 1);
+      if (num_bytes < 0) {
+        // Invalid video dimensions
+        av_frame_free(&g_state.video_frame);
+        av_frame_free(&g_state.video_frame_rgba);
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
+        continue;
+      }
+
+      g_state.video_buffer =
+          (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
+      if (!g_state.video_buffer) {
+        av_frame_free(&g_state.video_frame);
+        av_frame_free(&g_state.video_frame_rgba);
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
+        continue;
+      }
+
+      av_image_fill_arrays(
+          g_state.video_frame_rgba->data, g_state.video_frame_rgba->linesize,
+          g_state.video_buffer, AV_PIX_FMT_RGBA,
+          g_state.video_codec_ctx->width, g_state.video_codec_ctx->height, 1);
+
+      g_state.sws_ctx = sws_getContext(
+          g_state.video_codec_ctx->width, g_state.video_codec_ctx->height,
+          g_state.video_codec_ctx->pix_fmt, g_state.video_codec_ctx->width,
+          g_state.video_codec_ctx->height, AV_PIX_FMT_RGBA, SWS_BILINEAR,
+          NULL, NULL, NULL);
+
+      if (!g_state.sws_ctx) {
+        // Failed to create scaler
+        av_free(g_state.video_buffer);
+        g_state.video_buffer = NULL;
+        av_frame_free(&g_state.video_frame);
+        av_frame_free(&g_state.video_frame_rgba);
+        avcodec_free_context(&g_state.video_codec_ctx);
+        g_state.video_codec_ctx = NULL;
+        g_state.video_stream_idx = -1;
       }
     } else if (codec_par->codec_type == AVMEDIA_TYPE_AUDIO &&
                g_state.audio_stream_idx == -1) {
       g_state.audio_stream_idx = i;
       g_state.audio_codec_ctx = avcodec_alloc_context3(codec);
-      avcodec_parameters_to_context(g_state.audio_codec_ctx, codec_par);
+      if (!g_state.audio_codec_ctx) {
+        avformat_close_input(&g_state.fmt_ctx);
+        g_state.fmt_ctx = NULL;
+        return -3;
+      }
+      if (avcodec_parameters_to_context(g_state.audio_codec_ctx, codec_par) < 0) {
+        avcodec_free_context(&g_state.audio_codec_ctx);
+        g_state.audio_codec_ctx = NULL;
+        g_state.audio_stream_idx = -1;
+        continue;
+      }
       if (avcodec_open2(g_state.audio_codec_ctx, codec, NULL) < 0) {
-        log_msg(0, "Failed to open audio codec");
+        // Failed to open audio codec
+        avcodec_free_context(&g_state.audio_codec_ctx);
+        g_state.audio_codec_ctx = NULL;
+        g_state.audio_stream_idx = -1;
+        continue;
       } else {
         g_state.audio_frame = av_frame_alloc();
         g_state.audio_frame_converted = av_frame_alloc();
 
+        if (!g_state.audio_frame || !g_state.audio_frame_converted) {
+          if (g_state.audio_frame) av_frame_free(&g_state.audio_frame);
+          if (g_state.audio_frame_converted) av_frame_free(&g_state.audio_frame_converted);
+          avcodec_free_context(&g_state.audio_codec_ctx);
+          g_state.audio_codec_ctx = NULL;
+          g_state.audio_stream_idx = -1;
+          continue;
+        }
+
+        // Allocate buffer for audio frame conversion
+        int max_samples = g_state.audio_codec_ctx->frame_size;
+        if (max_samples <= 0)
+          max_samples = 1024; // Default buffer size
+
+        uint8_t **audio_data = NULL;
+        if (av_samples_alloc_array_and_samples(
+            &audio_data,
+            NULL,
+            2, // Output stereo
+            max_samples,
+            AV_SAMPLE_FMT_FLT,
+            0) < 0) {
+          // Failed to allocate audio buffer
+          av_frame_free(&g_state.audio_frame);
+          av_frame_free(&g_state.audio_frame_converted);
+          g_state.audio_frame = NULL;
+          g_state.audio_frame_converted = NULL;
+          avcodec_free_context(&g_state.audio_codec_ctx);
+          g_state.audio_codec_ctx = NULL;
+          g_state.audio_stream_idx = -1;
+          continue;
+        }
+
+        // Set frame properties
+        g_state.audio_frame_converted->format = AV_SAMPLE_FMT_FLT;
+        g_state.audio_frame_converted->nb_samples = 0;
+        AVChannelLayout stereo_layout = AV_CHANNEL_LAYOUT_STEREO;
+        av_channel_layout_copy(&g_state.audio_frame_converted->ch_layout, &stereo_layout);
+        g_state.audio_frame_converted->data[0] = audio_data[0];
+        g_state.audio_frame_converted->linesize[0] = max_samples * 2 * sizeof(float);
+
         // Initialize resampler to Float32 Interleaved
         AVChannelLayout out_ch_layout =
             AV_CHANNEL_LAYOUT_STEREO; // Default to stereo
-        if (g_state.audio_codec_ctx->ch_layout.nb_channels > 0) {
-          // Try to keep original layout if simple, otherwise force stereo
-          // For simplicity in this example, forcing Stereo Float32
-        }
 
-        swr_alloc_set_opts2(&g_state.swr_ctx, &out_ch_layout, AV_SAMPLE_FMT_FLT,
+        if (swr_alloc_set_opts2(&g_state.swr_ctx, &out_ch_layout, AV_SAMPLE_FMT_FLT,
                             g_state.audio_codec_ctx->sample_rate,
                             &g_state.audio_codec_ctx->ch_layout,
                             g_state.audio_codec_ctx->sample_fmt,
-                            g_state.audio_codec_ctx->sample_rate, 0, NULL);
-        swr_init(g_state.swr_ctx);
+                            g_state.audio_codec_ctx->sample_rate, 0, NULL) < 0) {
+          // Failed to allocate resampler
+          av_freep(&g_state.audio_frame_converted->data[0]);
+          av_frame_free(&g_state.audio_frame);
+          av_frame_free(&g_state.audio_frame_converted);
+          avcodec_free_context(&g_state.audio_codec_ctx);
+          g_state.audio_codec_ctx = NULL;
+          g_state.audio_stream_idx = -1;
+          continue;
+        }
+
+        if (swr_init(g_state.swr_ctx) < 0) {
+          // Failed to initialize resampler
+          swr_free(&g_state.swr_ctx);
+          av_freep(&g_state.audio_frame_converted->data[0]);
+          av_frame_free(&g_state.audio_frame);
+          av_frame_free(&g_state.audio_frame_converted);
+          avcodec_free_context(&g_state.audio_codec_ctx);
+          g_state.audio_codec_ctx = NULL;
+          g_state.audio_stream_idx = -1;
+          continue;
+        }
       }
     }
   }
@@ -173,12 +234,10 @@ int ffmpeg_open_media(const char *url) {
   // 4. Allocate work packet
   g_state.work_packet = av_packet_alloc();
   if (!g_state.work_packet) {
-    log_msg(0, "Failed to allocate work packet");
+    ffmpeg_stop();
     return -3;
   }
 
-  log_msg(2, "Media opened. Video Index: %d, Audio Index: %d",
-          g_state.video_stream_idx, g_state.audio_stream_idx);
   return 0;
 }
 
@@ -192,7 +251,6 @@ MediaInfo ffmpeg_get_media_info(void) {
       info.width = g_state.video_codec_ctx->width;
       info.height = g_state.video_codec_ctx->height;
 
-      // Best guess for fps
       double fps = 0.0;
       if (g_state.fmt_ctx->streams[g_state.video_stream_idx]
               ->avg_frame_rate.den != 0) {
@@ -201,7 +259,6 @@ MediaInfo ffmpeg_get_media_info(void) {
       }
       info.fps = fps;
 
-      // Estimate total frames if NB_FRAMES is not available
       int64_t frames =
           g_state.fmt_ctx->streams[g_state.video_stream_idx]->nb_frames;
       if (frames <= 0 && fps > 0 && info.duration_ms > 0) {
@@ -217,60 +274,54 @@ MediaInfo ffmpeg_get_media_info(void) {
   return info;
 }
 
-int ffmpeg_start_decoding(void) {
-  if (g_state.is_running)
-    return 0;
-
-  g_state.should_exit = false;
-  g_state.is_paused = false;
-  g_state.is_eof = false;
-  g_state.is_running = true;
-
-  if (pthread_create(&g_state.decode_thread, NULL, decoding_loop, NULL) != 0) {
-    g_state.is_running = false;
-    log_msg(0, "Failed to create decoding thread");
-    return -1;
-  }
-  return 0;
-}
-
-int ffmpeg_pause(void) {
-  g_state.is_paused = true;
-  return 0;
-}
-
-int ffmpeg_resume(void) {
-  g_state.is_paused = false;
-  return 0;
-}
-
 void ffmpeg_stop(void) {
-  g_state.should_exit = true;
-  if (g_state.is_running) {
-    pthread_join(g_state.decode_thread, NULL);
-    g_state.is_running = false;
-  }
-
   // Cleanup Resources
   if (g_state.video_codec_ctx) {
     avcodec_free_context(&g_state.video_codec_ctx);
-    sws_freeContext(g_state.sws_ctx);
-    av_frame_free(&g_state.video_frame);
-    av_frame_free(&g_state.video_frame_rgba);
-    av_free(g_state.video_buffer);
-    g_state.video_buffer = NULL;
+    g_state.video_codec_ctx = NULL;
   }
 
   if (g_state.audio_codec_ctx) {
     avcodec_free_context(&g_state.audio_codec_ctx);
-    swr_free(&g_state.swr_ctx);
-    av_frame_free(&g_state.audio_frame);
-    av_frame_free(&g_state.audio_frame_converted);
+    g_state.audio_codec_ctx = NULL;
   }
 
-  if (g_state.fmt_ctx) {
-    avformat_close_input(&g_state.fmt_ctx);
-    g_state.fmt_ctx = NULL;
+  if (g_state.sws_ctx) {
+    sws_freeContext(g_state.sws_ctx);
+    g_state.sws_ctx = NULL;
+  }
+
+  if (g_state.swr_ctx) {
+    swr_free(&g_state.swr_ctx);
+    g_state.swr_ctx = NULL;
+  }
+
+  if (g_state.video_frame) {
+    av_frame_free(&g_state.video_frame);
+    g_state.video_frame = NULL;
+  }
+
+  if (g_state.video_frame_rgba) {
+    av_frame_free(&g_state.video_frame_rgba);
+    g_state.video_frame_rgba = NULL;
+  }
+
+  if (g_state.video_buffer) {
+    av_free(g_state.video_buffer);
+    g_state.video_buffer = NULL;
+  }
+
+  if (g_state.audio_frame) {
+    av_frame_free(&g_state.audio_frame);
+    g_state.audio_frame = NULL;
+  }
+
+  if (g_state.audio_frame_converted) {
+    if (g_state.audio_frame_converted->data[0]) {
+      av_freep(&g_state.audio_frame_converted->data[0]);
+    }
+    av_frame_free(&g_state.audio_frame_converted);
+    g_state.audio_frame_converted = NULL;
   }
 
   if (g_state.work_packet) {
@@ -278,274 +329,319 @@ void ffmpeg_stop(void) {
     g_state.work_packet = NULL;
   }
 
+  if (g_state.fmt_ctx) {
+    avformat_close_input(&g_state.fmt_ctx);
+    g_state.fmt_ctx = NULL;
+  }
+
   g_state.video_stream_idx = -1;
   g_state.audio_stream_idx = -1;
 }
 
 int ffmpeg_seek(int64_t timestamp_ms) {
-  pthread_mutex_lock(&g_state.mutex);
-  if (!g_state.fmt_ctx) {
-    pthread_mutex_unlock(&g_state.mutex);
+  if (!g_state.fmt_ctx)
     return -1;
-  }
-  // Seek to timestamp based on AV_TIME_BASE
-  int64_t ts = timestamp_ms * 1000; // micro (AV_TIME_BASE is usually 1,000,000)
-  // Actually seek targets stream time bases, but av_seek_frame handles this if
-  // we use AVSEEK_FLAG_BACKWARD etc? Safer to use avformat_seek_file or simply
-  // rescale to stream base if needed. Simplifying: av_seek_frame with
-  // AV_TIME_BASE unit if stream_index is -1.
 
-  if (av_seek_frame(g_state.fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD) < 0) {
-    log_msg(1, "Seek failed");
-    pthread_mutex_unlock(&g_state.mutex);
+  int64_t timestamp = timestamp_ms * (AV_TIME_BASE / 1000);
+
+  if (av_seek_frame(g_state.fmt_ctx, -1, timestamp,
+                     AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY) < 0)
     return -1;
-  }
 
-  // Unref frames to release references to buffers that might be invalidated
-  if (g_state.video_frame)
-    av_frame_unref(g_state.video_frame);
-  if (g_state.audio_frame)
-    av_frame_unref(g_state.audio_frame);
-
-  // Flush codec buffers
-  if (g_state.video_codec_ctx)
-    avcodec_flush_buffers(g_state.video_codec_ctx);
-  if (g_state.audio_codec_ctx)
+  if (g_state.audio_codec_ctx) {
     avcodec_flush_buffers(g_state.audio_codec_ctx);
-
-  g_state.is_eof = false;
-  pthread_mutex_unlock(&g_state.mutex);
+  }
+  if (g_state.video_codec_ctx) {
+    avcodec_flush_buffers(g_state.video_codec_ctx);
+  }
 
   return 0;
 }
 
 int ffmpeg_seek_frame(int frame_index) {
-  if (!g_state.fmt_ctx || g_state.video_stream_idx == -1)
+  if (!g_state.fmt_ctx || g_state.video_stream_idx < 0)
     return -1;
 
-  AVStream *v_stream = g_state.fmt_ctx->streams[g_state.video_stream_idx];
-  double fps = av_q2d(v_stream->avg_frame_rate);
-  if (fps <= 0)
-    fps = 30.0; // Fallback
+  int64_t timestamp =
+      frame_index *
+      (g_state.fmt_ctx->streams[g_state.video_stream_idx]->duration /
+       g_state.fmt_ctx->streams[g_state.video_stream_idx]->nb_frames);
 
-  int64_t timestamp_ms = (int64_t)((frame_index / fps) * 1000.0);
-  return ffmpeg_seek(timestamp_ms);
+  return ffmpeg_seek(timestamp / (AV_TIME_BASE / 1000));
 }
 
-void ffmpeg_set_callbacks(OnVideoFrameCallback video_cb,
-                          OnAudioFrameCallback audio_cb, OnLogCallback log_cb) {
-  g_state.on_video = video_cb;
-  g_state.on_audio = audio_cb;
-  g_state.on_log = log_cb;
-}
+// Helper to seek to nearest frame before timestamp
+static int seek_to_frame_before_ts(int64_t target_ts_ms) {
+  if (!g_state.fmt_ctx)
+    return -1;
 
-void ffmpeg_start_decoding_loop_locked(void) {
-  // Helper to run one iteration of decoding logic while assuming lock is held
-  // Reuse the work packet
-  if (!g_state.work_packet)
-    return;
+  int64_t target_ts = target_ts_ms * (AV_TIME_BASE / 1000);
 
-  int ret = av_read_frame(g_state.fmt_ctx, g_state.work_packet);
-  if (ret < 0) {
-    if (ret == AVERROR_EOF) {
-      g_state.is_eof = true;
-    } else {
-      log_msg(0, "Error reading packet");
-    }
-    return;
+  // Seek backward to find first keyframe before target
+  if (av_seek_frame(g_state.fmt_ctx, -1, target_ts,
+                     AVSEEK_FLAG_BACKWARD) < 0) {
+    return -1;
   }
 
-  AVPacket *packet = g_state.work_packet;
+  // Flush buffers
+  if (g_state.video_codec_ctx) {
+    avcodec_flush_buffers(g_state.video_codec_ctx);
+  }
+  if (g_state.audio_codec_ctx) {
+    avcodec_flush_buffers(g_state.audio_codec_ctx);
+  }
 
-  if (packet->stream_index == g_state.video_stream_idx &&
-      g_state.video_codec_ctx) {
-    if (avcodec_send_packet(g_state.video_codec_ctx, packet) == 0) {
-      while (avcodec_receive_frame(g_state.video_codec_ctx,
-                                   g_state.video_frame) == 0) {
+  return 0;
+}
+
+static int decode_video_until_ts(int64_t target_ts_ms, VideoFrame **out_frame) {
+  if (!g_state.video_codec_ctx || !g_state.video_frame) return -1;
+
+  while (av_read_frame(g_state.fmt_ctx, g_state.work_packet) >= 0) {
+    if (g_state.work_packet->stream_index == g_state.video_stream_idx) {
+      int ret = avcodec_send_packet(g_state.video_codec_ctx, g_state.work_packet);
+      if (ret < 0) {
+        av_packet_unref(g_state.work_packet);
+        continue;
+      }
+
+      while (ret >= 0) {
+        ret = avcodec_receive_frame(g_state.video_codec_ctx, g_state.video_frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+          break;
+        } else if (ret < 0) {
+          av_packet_unref(g_state.work_packet);
+          return -1;
+        }
+
+        // Calculate frame timestamp in milliseconds
+        AVRational time_base = g_state.fmt_ctx->streams[g_state.video_stream_idx]->time_base;
+        int64_t frame_ts_ms = g_state.video_frame->pts * 1000 * time_base.num / time_base.den;
+
         // Convert to RGBA
-        sws_scale(
-            g_state.sws_ctx, (const uint8_t *const *)g_state.video_frame->data,
-            g_state.video_frame->linesize, 0, g_state.video_codec_ctx->height,
-            g_state.video_frame_rgba->data, g_state.video_frame_rgba->linesize);
+        sws_scale(g_state.sws_ctx,
+                  (const uint8_t *const *)g_state.video_frame->data,
+                  g_state.video_frame->linesize, 0,
+                  g_state.video_codec_ctx->height,
+                  g_state.video_frame_rgba->data,
+                  g_state.video_frame_rgba->linesize);
 
-        if (g_state.on_video) {
-          VideoFrame vframe = {0};
-          vframe.width = g_state.video_codec_ctx->width;
-          vframe.height = g_state.video_codec_ctx->height;
-          // Safeguard: Check if data is valid
-          if (g_state.video_frame_rgba->data[0] != NULL) {
-            vframe.linesize = g_state.video_frame_rgba->linesize[0];
-            vframe.data = g_state.video_frame_rgba->data[0];
+        // Calculate frame ID
+        int64_t frame_id = 0;
+        double fps = 0.0;
+        if (g_state.fmt_ctx->streams[g_state.video_stream_idx]
+                ->avg_frame_rate.den != 0) {
+          fps = av_q2d(
+              g_state.fmt_ctx->streams[g_state.video_stream_idx]->avg_frame_rate);
+        }
+        if (fps > 0) {
+          frame_id = (int64_t)(frame_ts_ms * fps / 1000.0);
+        }
 
-            double time_base = av_q2d(
-                g_state.fmt_ctx->streams[g_state.video_stream_idx]->time_base);
-            vframe.pts_ms = g_state.video_frame->pts * time_base * 1000;
+        // If we've reached or passed the target timestamp, return this frame
+        if (frame_ts_ms >= target_ts_ms) {
+          // Calculate proper buffer size for RGBA (4 bytes per pixel)
+          int buffer_size = g_state.video_codec_ctx->width * g_state.video_codec_ctx->height * 4;
 
-            // Calculate frame_id based on PTS and FPS
-            double fps =
-                av_q2d(g_state.fmt_ctx->streams[g_state.video_stream_idx]
-                           ->avg_frame_rate);
-            if (fps > 0) {
-              vframe.frame_id = (int64_t)((vframe.pts_ms / 1000.0) * fps + 0.5);
-            } else {
-              vframe.frame_id = -1;
-            }
-
-            g_state.on_video(&vframe);
+          *out_frame = (VideoFrame *)malloc(sizeof(VideoFrame));
+          if (!*out_frame) {
+            av_packet_unref(g_state.work_packet);
+            return -1;
           }
-        }
-      }
-    }
-  } else if (packet->stream_index == g_state.audio_stream_idx &&
-             g_state.audio_codec_ctx) {
-    if (avcodec_send_packet(g_state.audio_codec_ctx, packet) == 0) {
-      while (avcodec_receive_frame(g_state.audio_codec_ctx,
-                                   g_state.audio_frame) == 0) {
-        if (g_state.on_audio) {
-          AudioFrame aframe = {0};
-          // Stubbed for audio
-          g_state.on_audio(&aframe);
-        }
-      }
-    }
-  }
 
-  av_packet_unref(packet);
-  // Do NOT free packet, we reuse it.
-}
-
-void *decoding_loop(void *arg) {
-  while (!g_state.should_exit) {
-    if (g_state.is_paused || g_state.is_eof) {
-      usleep(10000); // Sleep 10ms
-      continue;
-    }
-
-    pthread_mutex_lock(&g_state.mutex);
-    if (g_state.fmt_ctx) {
-      ffmpeg_start_decoding_loop_locked();
-    }
-    pthread_mutex_unlock(&g_state.mutex);
-
-    // Tiny sleep to prevent monopolizing the mutex if we loop tight
-    // But av_read_frame is blocking usually? No, for files it's fast.
-    // For network it blocks.
-    // Let's yield a bit to allow other threads to grab mutex
-    // or just rely on OS scheduler.
-    // usleep(1);
-  }
-  return NULL;
-}
-
-// --- New Retrieval Methods ---
-
-int ffmpeg_get_frame_at_timestamp(int64_t timestamp_ms,
-                                  VideoFrame **out_frame) {
-  pthread_mutex_lock(&g_state.mutex);
-  if (!g_state.fmt_ctx || !g_state.video_codec_ctx) {
-    pthread_mutex_unlock(&g_state.mutex);
-    return -1;
-  }
-
-  int64_t ts = timestamp_ms * 1000; // to microseconds (simplified assumption)
-  // Better: rescale to stream time base
-  AVStream *v_stream = g_state.fmt_ctx->streams[g_state.video_stream_idx];
-  int64_t seek_target =
-      av_rescale_q(timestamp_ms, (AVRational){1, 1000}, v_stream->time_base);
-
-  if (av_seek_frame(g_state.fmt_ctx, g_state.video_stream_idx, seek_target,
-                    AVSEEK_FLAG_BACKWARD) < 0) {
-    // Try default seeking if stream specific fails
-    if (av_seek_frame(g_state.fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD) < 0) {
-      pthread_mutex_unlock(&g_state.mutex);
-      return -1;
-    }
-  }
-
-  avcodec_flush_buffers(g_state.video_codec_ctx);
-
-  // Decode until we find the frame
-  AVPacket *packet = av_packet_alloc();
-  bool found = false;
-  // Safety break to prevent infinite loops if end of stream
-  int max_packets = 500;
-
-  while (!found && max_packets-- > 0) {
-    if (av_read_frame(g_state.fmt_ctx, packet) < 0)
-      break;
-
-    if (packet->stream_index == g_state.video_stream_idx) {
-      if (avcodec_send_packet(g_state.video_codec_ctx, packet) == 0) {
-        while (avcodec_receive_frame(g_state.video_codec_ctx,
-                                     g_state.video_frame) == 0) {
-          // Check timestamp
-          int64_t frame_ts_ms =
-              g_state.video_frame->pts * av_q2d(v_stream->time_base) * 1000;
-          // Allow a small drift or just take the first one after seek?
-          // Usually seek goes to keyframe before. So we decode forward.
-          if (frame_ts_ms >= timestamp_ms) {
-            // Found it or passed it. Closest we can get?
-            // Let's assume this is the one.
-
-            // Convert to RGBA
-            sws_scale(g_state.sws_ctx,
-                      (const uint8_t *const *)g_state.video_frame->data,
-                      g_state.video_frame->linesize, 0,
-                      g_state.video_codec_ctx->height,
-                      g_state.video_frame_rgba->data,
-                      g_state.video_frame_rgba->linesize);
-
-            // Alienate data
-            VideoFrame *vf = (VideoFrame *)malloc(sizeof(VideoFrame));
-            vf->width = g_state.video_codec_ctx->width;
-            vf->height = g_state.video_codec_ctx->height;
-            vf->linesize = g_state.video_frame_rgba->linesize[0];
-            vf->pts_ms = frame_ts_ms;
-
-            double fps = av_q2d(v_stream->avg_frame_rate);
-            if (fps > 0) {
-              vf->frame_id = (int64_t)((frame_ts_ms / 1000.0) * fps + 0.5);
-            } else {
-              vf->frame_id = -1;
-            }
-
-            // Deep copy the buffer because g_state.video_frame_rgba is reused
-            int buf_size = vf->linesize * vf->height;
-            vf->data = (uint8_t *)malloc(buf_size);
-            memcpy(vf->data, g_state.video_frame_rgba->data[0], buf_size);
-
-            *out_frame = vf;
-            found = true;
-            break;
+          (*out_frame)->data = (uint8_t *)malloc(buffer_size);
+          if (!(*out_frame)->data) {
+            free(*out_frame);
+            *out_frame = NULL;
+            av_packet_unref(g_state.work_packet);
+            return -1;
           }
+
+          // Copy row by row to handle potential line size differences
+          for (int y = 0; y < g_state.video_codec_ctx->height; y++) {
+            memcpy(
+                (*out_frame)->data + y * g_state.video_codec_ctx->width * 4,
+                g_state.video_frame_rgba->data[0] + y * g_state.video_frame_rgba->linesize[0],
+                g_state.video_codec_ctx->width * 4  // Target is always width*4 for RGBA
+            );
+          }
+
+          (*out_frame)->width = g_state.video_codec_ctx->width;
+          (*out_frame)->height = g_state.video_codec_ctx->height;
+          (*out_frame)->linesize = g_state.video_codec_ctx->width * 4;  // linesize for output
+          (*out_frame)->pts_ms = frame_ts_ms;
+          (*out_frame)->frame_id = frame_id;
+
+          av_packet_unref(g_state.work_packet);
+          return 0; // Success
         }
       }
     }
-    av_packet_unref(packet);
+    av_packet_unref(g_state.work_packet);
   }
 
-  av_packet_free(&packet);
-  pthread_mutex_unlock(&g_state.mutex);
-  return found ? 0 : -1;
+  return -1; // Not found
 }
 
-int ffmpeg_get_frame_at_index(int frame_index, VideoFrame **out_frame) {
-  if (!g_state.fmt_ctx || g_state.video_stream_idx == -1)
+int ffmpeg_get_video_frame_at_timestamp(int64_t timestamp_ms,
+                                        VideoFrame **out_frame) {
+  if (!g_state.fmt_ctx || g_state.video_stream_idx < 0)
     return -1;
 
-  AVStream *v_stream = g_state.fmt_ctx->streams[g_state.video_stream_idx];
-  double fps = av_q2d(v_stream->avg_frame_rate);
+  // Seek to nearest frame before target
+  if (seek_to_frame_before_ts(timestamp_ms) < 0)
+    return -1;
+
+  // Decode until we find the frame at or after target timestamp
+  return decode_video_until_ts(timestamp_ms, out_frame);
+}
+
+int ffmpeg_get_video_frame_at_index(int frame_index, VideoFrame **out_frame) {
+  if (!g_state.fmt_ctx || g_state.video_stream_idx < 0)
+    return -1;
+
+  // Calculate timestamp for this frame
+  double fps = 0.0;
+  if (g_state.fmt_ctx->streams[g_state.video_stream_idx]
+          ->avg_frame_rate.den != 0) {
+    fps = av_q2d(
+        g_state.fmt_ctx->streams[g_state.video_stream_idx]->avg_frame_rate);
+  }
   if (fps <= 0)
-    fps = 30.0; // fallback
+    return -1;
 
-  int64_t timestamp_ms = (int64_t)((frame_index / fps) * 1000.0);
-  return ffmpeg_get_frame_at_timestamp(timestamp_ms, out_frame);
+  int64_t target_ts_ms = (int64_t)((frame_index / fps) * 1000.0);
+
+  // Seek and decode
+  return ffmpeg_get_video_frame_at_timestamp(target_ts_ms, out_frame);
 }
 
-void ffmpeg_free_frame(VideoFrame *frame) {
+static int decode_audio_until_ts(int64_t target_ts_ms, AudioFrame **out_frame) {
+  if (!g_state.audio_codec_ctx || !g_state.audio_frame || !g_state.swr_ctx)
+    return -1;
+
+  while (av_read_frame(g_state.fmt_ctx, g_state.work_packet) >= 0) {
+    if (g_state.work_packet->stream_index == g_state.audio_stream_idx) {
+      int ret = avcodec_send_packet(g_state.audio_codec_ctx, g_state.work_packet);
+      if (ret < 0) {
+        av_packet_unref(g_state.work_packet);
+        continue;
+      }
+
+      while (ret >= 0) {
+        ret = avcodec_receive_frame(g_state.audio_codec_ctx, g_state.audio_frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+          break;
+        } else if (ret < 0) {
+          av_packet_unref(g_state.work_packet);
+          return -1;
+        }
+
+        // Calculate frame timestamp in milliseconds
+        AVRational time_base = g_state.fmt_ctx->streams[g_state.audio_stream_idx]->time_base;
+        int64_t frame_ts_ms = g_state.audio_frame->pts * 1000 * time_base.num / time_base.den;
+
+        // Convert to Float32 Interleaved
+        int dst_nb_samples = swr_convert(
+            g_state.swr_ctx,
+            g_state.audio_frame_converted->data,
+            g_state.audio_frame->nb_samples,
+            (const uint8_t **)g_state.audio_frame->data,
+            g_state.audio_frame->nb_samples);
+
+        if (dst_nb_samples < 0) {
+          av_packet_unref(g_state.work_packet);
+          return -1;
+        }
+
+        // If we've reached or passed the target timestamp, return this frame
+        if (frame_ts_ms >= target_ts_ms && dst_nb_samples > 0) {
+          *out_frame = (AudioFrame *)malloc(sizeof(AudioFrame));
+          if (!*out_frame) {
+            av_packet_unref(g_state.work_packet);
+            return -1;
+          }
+
+          // Use the number of channels from the converted frame
+          int num_channels = g_state.audio_frame_converted->ch_layout.nb_channels;
+          size_t data_size = dst_nb_samples * num_channels * sizeof(float);
+          (*out_frame)->data = (float *)malloc(data_size);
+          if (!(*out_frame)->data) {
+            free(*out_frame);
+            *out_frame = NULL;
+            av_packet_unref(g_state.work_packet);
+            return -1;
+          }
+
+          memcpy((*out_frame)->data, g_state.audio_frame_converted->data[0],
+                 data_size);
+
+          (*out_frame)->samples_count = dst_nb_samples;
+          (*out_frame)->channels = num_channels;
+          (*out_frame)->sample_rate = g_state.audio_codec_ctx->sample_rate;
+          (*out_frame)->pts_ms = frame_ts_ms;
+
+          av_packet_unref(g_state.work_packet);
+          return 0; // Success
+        }
+      }
+    }
+    av_packet_unref(g_state.work_packet);
+  }
+
+  return -1; // Not found
+}
+
+int ffmpeg_get_audio_frame_at_timestamp(int64_t timestamp_ms,
+                                        AudioFrame **out_frame) {
+  if (!g_state.fmt_ctx || g_state.audio_stream_idx < 0)
+    return -1;
+
+  // Seek to nearest frame before target
+  if (seek_to_frame_before_ts(timestamp_ms) < 0)
+    return -1;
+
+  // Decode until we find the frame at or after target timestamp
+  return decode_audio_until_ts(timestamp_ms, out_frame);
+}
+
+int ffmpeg_get_audio_frame_at_index(int frame_index, AudioFrame **out_frame) {
+  if (!g_state.fmt_ctx || g_state.audio_stream_idx < 0)
+    return -1;
+
+  // For audio, we estimate based on sample rate
+  if (!g_state.audio_codec_ctx)
+    return -1;
+
+  int samples_per_frame = g_state.audio_codec_ctx->frame_size;
+  if (samples_per_frame <= 0)
+    samples_per_frame = 1024;
+
+  int64_t frame_duration_ms =
+      (samples_per_frame * 1000) / g_state.audio_codec_ctx->sample_rate;
+  int64_t target_ts_ms = frame_index * frame_duration_ms;
+
+  return ffmpeg_get_audio_frame_at_timestamp(target_ts_ms, out_frame);
+}
+
+void ffmpeg_free_video_frame(VideoFrame *frame) {
   if (frame) {
     if (frame->data)
       free(frame->data);
     free(frame);
   }
+}
+
+void ffmpeg_free_audio_frame(AudioFrame *frame) {
+  if (frame) {
+    if (frame->data)
+      free(frame->data);
+    free(frame);
+  }
+}
+
+void ffmpeg_release(void) {
+  // Per-media cleanup is done by ffmpeg_stop(), but ensure that's called
+  ffmpeg_stop();
+  g_state.is_initialized = 0;
 }

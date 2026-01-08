@@ -4,11 +4,37 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <stdlib.h>
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // --- Data Structures ---
+
+// Internal state structure for FFmpeg streaming
+typedef struct {
+  AVFormatContext *fmt_ctx;
+  AVCodecContext *video_codec_ctx;
+  AVCodecContext *audio_codec_ctx;
+  SwsContext *sws_ctx;
+  SwrContext *swr_ctx;
+  AVFrame *video_frame;
+  AVFrame *video_frame_rgba;
+  AVFrame *audio_frame;
+  AVFrame *audio_frame_converted;
+  AVPacket *work_packet;
+  uint8_t *video_buffer;
+  int video_stream_idx;
+  int audio_stream_idx;
+  int is_initialized;
+} FFmpegState;
 
 typedef struct {
   int64_t duration_ms;
@@ -38,19 +64,6 @@ typedef struct {
   int64_t frame_id;
 } AudioFrame;
 
-// --- Callback Types ---
-
-// Callback when a video frame is available.
-// The data pointer is valid only during the callback.
-typedef void (*OnVideoFrameCallback)(VideoFrame *frame);
-
-// Callback when an audio frame is available.
-// The data pointer is valid only during the callback.
-typedef void (*OnAudioFrameCallback)(AudioFrame *frame);
-
-// Callback for logging. level: 0=error, 1=warning, 2=info, 3=debug
-typedef void (*OnLogCallback)(int level, const char *message);
-
 // --- Core API ---
 
 // Global initialization of FFmpeg (network, etc).
@@ -64,17 +77,7 @@ int ffmpeg_open_media(const char *url);
 // Returns a MediaInfo struct. Check duration_ms == -1 for validity if needed.
 MediaInfo ffmpeg_get_media_info(void);
 
-// Start decoding. This should spawn a background thread or be part of the loop.
-// For this simplified version, we assume this starts the internal loop threads.
-int ffmpeg_start_decoding(void);
-
-// Pause decoding.
-int ffmpeg_pause(void);
-
-// Resume decoding.
-int ffmpeg_resume(void);
-
-// Stop decoding and release per-media resources (but keep core initialized).
+// Stop and release per-media resources (but keep core initialized).
 void ffmpeg_stop(void);
 
 // Seek to a timestamp in milliseconds.
@@ -83,22 +86,31 @@ int ffmpeg_seek(int64_t timestamp_ms);
 // Seek to a specific frame index.
 int ffmpeg_seek_frame(int frame_index);
 
-// Retrieve a single frame at the specified timestamp.
-// The caller is responsible for freeing the frame using ffmpeg_free_frame.
+// Retrieve a single video frame at the specified timestamp.
+// The caller is responsible for freeing the frame using ffmpeg_free_video_frame.
 // Returns 0 on success, negative on error.
-int ffmpeg_get_frame_at_timestamp(int64_t timestamp_ms, VideoFrame **out_frame);
+int ffmpeg_get_video_frame_at_timestamp(int64_t timestamp_ms, VideoFrame **out_frame);
 
-// Retrieve a single frame by index.
-// The caller is responsible for freeing the frame using ffmpeg_free_frame.
+// Retrieve a single video frame by index.
+// The caller is responsible for freeing the frame using ffmpeg_free_video_frame.
 // Returns 0 on success, negative on error.
-int ffmpeg_get_frame_at_index(int frame_index, VideoFrame **out_frame);
+int ffmpeg_get_video_frame_at_index(int frame_index, VideoFrame **out_frame);
+
+// Retrieve a single audio frame at the specified timestamp.
+// The caller is responsible for freeing the frame using ffmpeg_free_audio_frame.
+// Returns 0 on success, negative on error.
+int ffmpeg_get_audio_frame_at_timestamp(int64_t timestamp_ms, AudioFrame **out_frame);
+
+// Retrieve a single audio frame by index.
+// The caller is responsible for freeing the frame using ffmpeg_free_audio_frame.
+// Returns 0 on success, negative on error.
+int ffmpeg_get_audio_frame_at_index(int frame_index, AudioFrame **out_frame);
 
 // Free a VideoFrame allocated by the get_frame functions.
-void ffmpeg_free_frame(VideoFrame *frame);
+void ffmpeg_free_video_frame(VideoFrame *frame);
 
-// Set callbacks for Dart.
-void ffmpeg_set_callbacks(OnVideoFrameCallback video_cb,
-                          OnAudioFrameCallback audio_cb, OnLogCallback log_cb);
+// Free an AudioFrame allocated by the get_frame functions.
+void ffmpeg_free_audio_frame(AudioFrame *frame);
 
 // Global cleanup.
 void ffmpeg_release(void);

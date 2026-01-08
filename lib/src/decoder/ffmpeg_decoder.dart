@@ -1,248 +1,398 @@
-import 'dart:async';
 import 'dart:ffi';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import '../ffi/lotterwise_ffmpeg_bindings.dart' as ffi_bindings;
-import '../models/media_info.dart';
 import '../models/frame_data.dart';
 
-/// Represents a source for FFmpeg media, either a file path or a URL.
-class FfmpegMediaSource {
-  /// The path to the media file or the URL string.
-  final String path;
-  
-  /// Whether the source is a URL (true) or a local file path (false).
-  final bool isUrl;
-
-  /// Creates a media source from a local file path.
-  FfmpegMediaSource.fromFile(this.path) : isUrl = false;
-
-  /// Creates a media source from a network URL.
-  FfmpegMediaSource.fromUrl(this.path) : isUrl = true;
-}
-
-/// A decoder using FFmpeg native bindings to read video and audio frames.
+/// FFmpeg-based decoder for media files.
+/// Provides frame-by-frame access to both video and audio content.
 class FfmpegDecoder {
-  static final ffi_bindings.LotterwiseFfmpegBindings _bindings = 
-      ffi_bindings.LotterwiseFfmpegBindings();
-  
-  static bool _initialized = false;
+  final ffi_bindings.LotterwiseFfmpegBindings _bindings;
 
-  /// Ensures that the native FFmpeg bindings are initialized.
-  /// This is called automatically by [open].
-  static void ensureInitialized() {
-    if (!_initialized) {
-      _bindings.init();
-      _initialized = true;
+  bool _isInitialized = false;
+  bool _isOpened = false;
+
+  int _durationMs = 0;
+  int _videoWidth = 0;
+  int _videoHeight = 0;
+  double _fps = 0;
+  int _totalFrames = 0;
+  int _currentFrameIndex = 0;
+
+  int _audioSampleRate = 0;
+  int _audioChannels = 0;
+
+  /// Creates a new FFmpeg decoder instance.
+  FfmpegDecoder() : _bindings = ffi_bindings.LotterwiseFfmpegBindings() {
+    _initialize();
+  }
+
+  /// Initializes FFmpeg library.
+  Future<void> _initialize() async {
+    if (_isInitialized) return;
+
+    _bindings.init();
+    _isInitialized = true;
+  }
+
+  /// Opens a media file.
+  ///
+  /// Returns [true] if the file was opened successfully.
+  Future<bool> openMedia(String filePath) async {
+    if (!_isInitialized) {
+      await _initialize();
     }
-  }
 
-  // Streams
-  final _videoController = StreamController<VideoFrame>.broadcast();
-  final _audioController = StreamController<AudioFrame>.broadcast();
-
-  /// Stream of decoded video frames.
-  /// Listen to this stream to render video playback.
-  Stream<VideoFrame> get videoFrames => _videoController.stream;
-
-  /// Stream of decoded audio frames.
-  /// Listen to this stream to play audio.
-  Stream<AudioFrame> get audioFrames => _audioController.stream;
-
-  // Native Listeners
-  NativeCallable<ffi_bindings.NativeOnVideoFrame>? _videoListener;
-  NativeCallable<ffi_bindings.NativeOnAudioFrame>? _audioListener;
-  NativeCallable<ffi_bindings.NativeOnLog>? _logListener;
-
-  /// Opens a media source for decoding.
-  ///
-  /// This initializes the decoder, sets up native callbacks, and opens the
-  /// specified [source].
-  ///
-  /// Throws an exception if opening the media fails.
-  Future<void> open(FfmpegMediaSource source) async {
-    ensureInitialized();
-
-    // Setup Callbacks
-    _videoListener = NativeCallable<ffi_bindings.NativeOnVideoFrame>.listener(_onVideoFrame);
-    _audioListener = NativeCallable<ffi_bindings.NativeOnAudioFrame>.listener(_onAudioFrame);
-    _logListener = NativeCallable<ffi_bindings.NativeOnLog>.listener(_onLog);
-
-    _bindings.setCallbacks(
-      _videoListener!.nativeFunction,
-      _audioListener!.nativeFunction,
-      _logListener!.nativeFunction,
-    );
-    
-    final pathPtr = source.path.toNativeUtf8();
-    final result = _bindings.openMedia(pathPtr);
-    calloc.free(pathPtr);
-
-    if (result < 0) {
-      throw Exception('Failed to open media: error code $result');
+    // Close any previously opened media
+    if (_isOpened) {
+      await release();
     }
+
+    final filePathC = filePath.toNativeUtf8();
+    final result = _bindings.openMedia(filePathC.cast());
+    calloc.free(filePathC);
+
+    if (result == 0) {
+      _isOpened = true;
+      _loadMediaInfo();
+      _currentFrameIndex = 0;
+      return true;
+    }
+
+    return false;
   }
 
-  /// Retrieves media information such as duration, resolution, and frame rate.
-  /// 
-  /// This should be called after [open].
-  Future<MediaInfo> get mediaInfo async {
-    final info = _bindings.getMediaInfo();
-    return MediaInfo(
-      duration: Duration(milliseconds: info.durationMs),
-      width: info.width,
-      height: info.height,
-      fps: info.fps,
-      audioSampleRate: info.audioSampleRate,
-      audioChannels: info.audioChannels,
-      totalFrames: info.totalFrames,
-    );
+  /// Loads media information after opening a file.
+  void _loadMediaInfo() {
+    final mediaInfo = _bindings.getMediaInfo();
+    _durationMs = mediaInfo.durationMs;
+    _videoWidth = mediaInfo.width;
+    _videoHeight = mediaInfo.height;
+    _fps = mediaInfo.fps;
+    _totalFrames = mediaInfo.totalFrames;
+    _audioSampleRate = mediaInfo.audioSampleRate;
+    _audioChannels = mediaInfo.audioChannels;
   }
 
-  /// Starts or resumes decoding.
+  /// Returns the duration of the media in milliseconds.
+  int get durationMs => _durationMs;
+
+  /// Returns the video width.
+  int get videoWidth => _videoWidth;
+
+  /// Returns the video height.
+  int get videoHeight => _videoHeight;
+
+  /// Returns the video frame rate (frames per second).
+  double get fps => _fps;
+
+  /// Returns the total number of frames.
+  /// May be 0 if the video doesn't provide this information.
+  int get totalFrames => _totalFrames;
+
+  /// Returns the audio sample rate (Hz).
+  int get audioSampleRate => _audioSampleRate;
+
+  /// Returns the number of audio channels.
+  int get audioChannels => _audioChannels;
+
+  /// Returns whether the media file has video.
+  bool get hasVideo => _videoWidth > 0 && _videoHeight > 0;
+
+  /// Returns whether the media file has audio.
+  bool get hasAudio => _audioSampleRate > 0 && _audioChannels > 0;
+
+  /// Returns the current frame index.
+  int get currentFrameIndex => _currentFrameIndex;
+
+  /// Retrieves a specific frame by its index.
   ///
-  /// This triggers the native decoder loop which will start emitting frames
-  /// to [videoFrames] and [audioFrames].
-  Future<void> play() async {
-    _bindings.startDecoding();
-    _bindings.resume();
-  }
+  /// Returns a [MediaFrame] containing both video and audio data if available,
+  /// or null if retrieval failed.
+  /// The frame is automatically cached in memory - remember to free it.
+  Future<MediaFrame?> getFrameAtIndex(int index) async {
+    if (!_isOpened || index < 0) return null;
 
+    // Get video frame
+    final videoFramePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
+    VideoFrame? videoFrame;
 
-
-  /// Pauses decoding.
-  Future<void> pause() async {
-    _bindings.pause();
-  }
-
-
-
-  Future<void> seek(Duration position) async {
-    _bindings.seek(position.inMilliseconds);
-  }
-
-  /// Seeks to a specific frame index.
-  Future<void> seekToFrame(int frameIndex) async {
-    _bindings.seekFrame(frameIndex);
-  }
-
-  /// Retrieves a specific video frame at the given timestamp in milliseconds.
-  ///
-  /// Returns `null` if the frame could not be retrieved.
-  Future<VideoFrame?> getFrameAtTimestamp(int timestampMs) async {
-    final framePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
-    
     try {
-      final result = _bindings.getFrameAtTimestamp(timestampMs, framePtrPtr);
-      if (result < 0 || framePtrPtr.value == nullptr) {
-        return null;
+      final videoResult = _bindings.getVideoFrameAtIndex(index, videoFramePtrPtr);
+      if (videoResult >= 0 && videoFramePtrPtr.value != nullptr) {
+        videoFrame = _convertAndFreeVideoFrame(videoFramePtrPtr.value);
+        _currentFrameIndex = index;
       }
-      
-      return _convertAndFreeFrame(framePtrPtr.value);
+    } catch (e) {
+      // Video retrieval failed
     } finally {
-      calloc.free(framePtrPtr);
+      calloc.free(videoFramePtrPtr);
     }
-  }
 
+    // Get audio frame
+    final audioFramePtrPtr = calloc<Pointer<ffi_bindings.AudioFrame>>();
+    AudioFrame? audioFrame;
 
-
-  /// Retrieves a specific video frame by its index.
-  ///
-  /// Returns `null` if the frame could not be retrieved.
-  Future<VideoFrame?> getFrameAtIndex(int index) async {
-    final framePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
-    
     try {
-      final result = _bindings.getFrameAtIndex(index, framePtrPtr);
-       if (result < 0 || framePtrPtr.value == nullptr) {
-        return null;
+      final audioResult = _bindings.getAudioFrameAtIndex(index, audioFramePtrPtr);
+      if (audioResult >= 0 && audioFramePtrPtr.value != nullptr) {
+        audioFrame = _convertAndFreeAudioFrame(audioFramePtrPtr.value);
       }
-      return _convertAndFreeFrame(framePtrPtr.value);
+    } catch (e) {
+      // Audio retrieval failed
     } finally {
-      calloc.free(framePtrPtr);
+      calloc.free(audioFramePtrPtr);
     }
+
+    // Return combined frame
+    if (videoFrame != null) {
+      if (audioFrame != null) {
+        return MediaFrame.withBoth(videoFrame, audioFrame);
+      }
+      return MediaFrame.withVideo(videoFrame);
+    } else if (audioFrame != null) {
+      return MediaFrame.withAudio(audioFrame);
+    }
+
+    return null;
   }
 
-  VideoFrame _convertAndFreeFrame(Pointer<ffi_bindings.VideoFrame> framePtr) {
-    try {
-      final frame = framePtr.ref;
-      final size = frame.linesize * frame.height;
-      final data = Uint8List.fromList(frame.data.asTypedList(size));
-      
-      return VideoFrame(
-        rgbaBytes: data,
-        width: frame.width,
-        height: frame.height,
-        pts: Duration(milliseconds: frame.ptsMs),
-        frameId: frame.frameId,
-      );
-    } finally {
-      _bindings.freeFrame(framePtr);
-    }
-  }
-
-
-
-  /// Closes the decoder and releases resources.
+  /// Retrieves a specific frame at the given timestamp in milliseconds.
   ///
-  /// Stops the decoding loop and closes stream controllers and native listeners.
-  /// Ideally call [dispose] instead which aliases this method.
-  Future<void> close() async {
-    _bindings.stop();
-    _videoListener?.close();
-    _audioListener?.close();
-    _logListener?.close();
-    _videoController.close();
-    _audioController.close();
+  /// Returns a [MediaFrame] containing both video and audio data if available,
+  /// or null if retrieval failed.
+  Future<MediaFrame?> getFrameAtTimestamp(int timestampMs) async {
+    if (!_isOpened || timestampMs < 0) return null;
+
+    // Get video frame
+    final videoFramePtrPtr = calloc<Pointer<ffi_bindings.VideoFrame>>();
+    VideoFrame? videoFrame;
+
+    try {
+      final videoResult = _bindings.getVideoFrameAtTimestamp(timestampMs, videoFramePtrPtr);
+      if (videoResult >= 0 && videoFramePtrPtr.value != nullptr) {
+        videoFrame = _convertAndFreeVideoFrame(videoFramePtrPtr.value);
+      }
+    } catch (e) {
+      // Video retrieval failed
+    } finally {
+      calloc.free(videoFramePtrPtr);
+    }
+
+    // Get audio frame
+    final audioFramePtrPtr = calloc<Pointer<ffi_bindings.AudioFrame>>();
+    AudioFrame? audioFrame;
+
+    try {
+      final audioResult = _bindings.getAudioFrameAtTimestamp(timestampMs, audioFramePtrPtr);
+      if (audioResult >= 0 && audioFramePtrPtr.value != nullptr) {
+        audioFrame = _convertAndFreeAudioFrame(audioFramePtrPtr.value);
+      }
+    } catch (e) {
+      // Audio retrieval failed
+    } finally {
+      calloc.free(audioFramePtrPtr);
+    }
+
+    // Update frame index if we have a frame
+    if (videoFrame != null && _fps > 0) {
+      _currentFrameIndex = (videoFrame.pts.inMilliseconds * _fps / 1000).round();
+    }
+
+    // Return combined frame
+    if (videoFrame != null) {
+      if (audioFrame != null) {
+        return MediaFrame.withBoth(videoFrame, audioFrame);
+      }
+      return MediaFrame.withVideo(videoFrame);
+    } else if (audioFrame != null) {
+      return MediaFrame.withAudio(audioFrame);
+    }
+
+    return null;
   }
 
+  /// Retrieves a range of frames by index.
+  ///
+  /// Returns a list of [MediaFrame] objects. The list may contain fewer frames
+  /// than requested if reaching end of media or if retrieval fails.
+  Future<List<MediaFrame>> getFramesRangeByIndex(int start, int end) async {
+    final frames = <MediaFrame>[];
 
+    for (int i = start; i <= end; i++) {
+      final frame = await getFrameAtIndex(i);
+      if (frame != null) {
+        frames.add(frame);
+      } else {
+        break; // Stop if frame retrieval fails (likely EOF)
+      }
+    }
 
-  /// Disposes the decoder, releasing all native and Dart resources.
-  void dispose() {
-    close();
+    return frames;
   }
 
-  // --- Internal Callbacks ---
-  
-  void _onVideoFrame(Pointer<ffi_bindings.VideoFrame> framePtr) {
-    if (_videoController.isClosed) return;
-    
+  /// Retrieves a range of frames by timestamp.
+  ///
+  /// Returns a list of [MediaFrame] objects. The list may contain fewer frames
+  /// than requested if reaching end of media or if retrieval fails.
+  Future<List<MediaFrame>> getFramesRangeByTimestamp(
+      int startMs, int endMs, int stepMs) async {
+    final frames = <MediaFrame>[];
+
+    for (int ts = startMs; ts <= endMs; ts += stepMs) {
+      final frame = await getFrameAtTimestamp(ts);
+      if (frame != null) {
+        frames.add(frame);
+      } else {
+        break; // Stop if frame retrieval fails (likely EOF)
+      }
+    }
+
+    return frames;
+  }
+
+  /// Moves to the next frame.
+  ///
+  /// Returns the next [MediaFrame] or null if already at the end.
+  Future<MediaFrame?> nextFrame() async {
+    if (!_isOpened) return null;
+
+    _currentFrameIndex++;
+    return await getFrameAtIndex(_currentFrameIndex);
+  }
+
+  /// Moves to the previous frame.
+  ///
+  /// Returns the previous [MediaFrame] or null if already at the beginning.
+  Future<MediaFrame?> previousFrame() async {
+    if (!_isOpened || _currentFrameIndex <= 0) return null;
+
+    _currentFrameIndex--;
+    return await getFrameAtIndex(_currentFrameIndex);
+  }
+
+  /// Converts a native video frame to a Dart VideoFrame and frees the native memory.
+  VideoFrame _convertAndFreeVideoFrame(Pointer<ffi_bindings.VideoFrame> framePtr) {
     final frame = framePtr.ref;
-    final size = frame.linesize * frame.height;
-    
-    // Copy data to Dart heap
-    final data = Uint8List.fromList(frame.data.asTypedList(size));
 
-    _videoController.add(VideoFrame(
-      rgbaBytes: data,
+    // Safety checks
+    final dataSize = frame.linesize * frame.height;
+    if (dataSize <= 0 || dataSize > 100 * 1024 * 1024) { // Max 100MB
+      throw StateError('Invalid video frame data size: $dataSize bytes');
+    }
+
+    final rgbaBytes = Uint8List(dataSize);
+    
+    // Check pointer validity before access
+    if (frame.data == nullptr) {
+      throw StateError('Native frame data pointer is null');
+    }
+
+    // Convert to Pointer<Uint8> and copy data element by element
+    final nativePtr = frame.data.cast<Uint8>();
+    
+    try {
+      // Use a safer copy approach - read in chunks to avoid any FFI issues
+      const chunkSize = 4096;
+      int offset = 0;
+      
+      while (offset < dataSize) {
+        final remaining = dataSize - offset;
+        final currentChunk = remaining < chunkSize ? remaining : chunkSize;
+        
+        for (int i = 0; i < currentChunk; i++) {
+          rgbaBytes[offset + i] = nativePtr[offset + i];
+        }
+        
+        offset += currentChunk;
+      }
+    } catch (e) {
+      throw StateError('Failed to copy video frame data: $e');
+    }
+
+    final videoFrame = VideoFrame(
       width: frame.width,
       height: frame.height,
+      rgbaBytes: rgbaBytes,
       pts: Duration(milliseconds: frame.ptsMs),
       frameId: frame.frameId,
-    ));
+    );
+
+    // Free the native frame AFTER copying data
+    _bindings.freeVideoFrame(framePtr);
+
+    return videoFrame;
   }
 
-  void _onAudioFrame(Pointer<ffi_bindings.AudioFrame> framePtr) {
-    if (_audioController.isClosed) return;
-
+  /// Converts a native audio frame to a Dart AudioFrame and frees the native memory.
+  AudioFrame _convertAndFreeAudioFrame(Pointer<ffi_bindings.AudioFrame> framePtr) {
     final frame = framePtr.ref;
-    final totalSamples = frame.samplesCount * frame.channels;
-    
-    // Copy data
-    final data = Float32List.fromList(frame.data.asTypedList(totalSamples));
 
-    _audioController.add(AudioFrame(
-      samples: data,
+    // Safety checks
+    final dataSize = frame.samplesCount * frame.channels;
+    if (dataSize <= 0 || dataSize > 10 * 1024 * 1024) { // Max 10M samples
+      throw StateError('Invalid audio frame data size: $dataSize samples');
+    }
+
+    final samples = Float32List(dataSize);
+
+    // Check pointer validity before access
+    if (frame.data == nullptr) {
+      throw StateError('Native audio data pointer is null');
+    }
+
+    // Convert to Pointer<Float> and copy data sample by sample
+    final nativePtr = frame.data.cast<Float>();
+    
+    try {
+      // Copy in chunks for safety
+      const chunkSize = 1024;
+      int offset = 0;
+      
+      while (offset < dataSize) {
+        final remaining = dataSize - offset;
+        final currentChunk = remaining < chunkSize ? remaining : chunkSize;
+        
+        for (int i = 0; i < currentChunk; i++) {
+          samples[offset + i] = nativePtr[offset + i];
+        }
+        
+        offset += currentChunk;
+      }
+    } catch (e) {
+      throw StateError('Failed to copy audio frame data: $e');
+    }
+
+    final audioFrame = AudioFrame(
       sampleRate: frame.sampleRate,
       channels: frame.channels,
+      samples: samples,
       pts: Duration(milliseconds: frame.ptsMs),
-    ));
+    );
+
+    // Free the native frame AFTER copying data
+    _bindings.freeAudioFrame(framePtr);
+
+    return audioFrame;
   }
 
-  void _onLog(int level, Pointer<Utf8> msg) {
-    if (level < 2) { // Errors & warnings
-      //print('[FFmpeg Log] ${msg.toDartString()}');
+  /// Releases all resources and closes the media file.
+  Future<void> release() async {
+    if (_isOpened) {
+      _bindings.stop();
+      _isOpened = false;
     }
+
+    _durationMs = 0;
+    _videoWidth = 0;
+    _videoHeight = 0;
+    _fps = 0;
+    _totalFrames = 0;
+    _currentFrameIndex = 0;
+  }
+
+  /// Cleans up the native FFmpeg resources.
+  Future<void> dispose() async {
+    await release();
   }
 }

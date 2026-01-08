@@ -47,3 +47,48 @@ class AudioFrame {
     required this.pts,
   });
 }
+
+/// Represents a complete media frame containing both video and audio data.
+class MediaFrame {
+  /// The video data of this frame, if available.
+  final VideoFrame? video;
+
+  /// The audio data of this frame, if available.
+  final AudioFrame? audio;
+
+  /// The presentation timestamp of this frame.
+  Duration get pts {
+    return video?.pts ?? audio?.pts ?? Duration.zero;
+  }
+
+  /// The frame ID.
+  int get frameId {
+    return video?.frameId ?? 0;
+  }
+
+  /// Whether this frame contains video data.
+  bool get hasVideo => video != null;
+
+  /// Whether this frame contains audio data.
+  bool get hasAudio => audio != null;
+
+  MediaFrame({
+    this.video,
+    this.audio,
+  });
+
+  /// Creates a MediaFrame with only video data.
+  MediaFrame.withVideo(this.video) : audio = null;
+
+  /// Creates a MediaFrame with only audio data.
+  MediaFrame.withAudio(this.audio) : video = null;
+
+  /// Creates a MediaFrame with both video and audio data.
+  MediaFrame.withBoth(this.video, this.audio);
+
+  /// Returns video-only frame using the existing video data.
+  VideoFrame? toVideoFrame() => video;
+
+  /// Returns audio-only frame using the existing audio data.
+  AudioFrame? toAudioFrame() => audio;
+}

@@ -65,17 +65,6 @@ final class AudioFrame extends Struct {
   external int frameId;
 }
 
-// --- Callback Signatures ---
-
-typedef NativeOnVideoFrame = Void Function(Pointer<VideoFrame> frame);
-typedef DartOnVideoFrame = void Function(Pointer<VideoFrame> frame);
-
-typedef NativeOnAudioFrame = Void Function(Pointer<AudioFrame> frame);
-typedef DartOnAudioFrame = void Function(Pointer<AudioFrame> frame);
-
-typedef NativeOnLog = Void Function(Int32 level, Pointer<Utf8> message);
-typedef DartOnLog = void Function(int level, Pointer<Utf8> message);
-
 // --- Function Signatures ---
 
 typedef NativeFfmpegInit = Void Function();
@@ -90,43 +79,42 @@ typedef DartFfmpegOpenMedia = int Function(Pointer<Utf8> url);
 typedef NativeFfmpegGetMediaInfo = MediaInfo Function();
 typedef DartFfmpegGetMediaInfo = MediaInfo Function();
 
-typedef NativeFfmpegStartDecoding = Int32 Function();
-typedef DartFfmpegStartDecoding = int Function();
-
-typedef NativeFfmpegPause = Int32 Function();
-typedef DartFfmpegPause = int Function();
-
-typedef NativeFfmpegResume = Int32 Function();
-typedef DartFfmpegResume = int Function();
-
-typedef NativeFfmpegStop = Void Function();
-typedef DartFfmpegStop = void Function();
-
 typedef NativeFfmpegSeek = Int32 Function(Int64 timestampMs);
 typedef DartFfmpegSeek = int Function(int timestampMs);
 
 typedef NativeFfmpegSeekFrame = Int32 Function(Int32 frameIndex);
 typedef DartFfmpegSeekFrame = int Function(int frameIndex);
 
-typedef NativeFfmpegSetCallbacks = Void Function(
-    Pointer<NativeFunction<NativeOnVideoFrame>> videoCb,
-    Pointer<NativeFunction<NativeOnAudioFrame>> audioCb,
-    Pointer<NativeFunction<NativeOnLog>> logCb);
-typedef DartFfmpegSetCallbacks = void Function(
-    Pointer<NativeFunction<NativeOnVideoFrame>> videoCb,
-    Pointer<NativeFunction<NativeOnAudioFrame>> audioCb,
-    Pointer<NativeFunction<NativeOnLog>> logCb);
+typedef NativeFfmpegStop = Void Function();
+typedef DartFfmpegStop = void Function();
 
-// --- New Bindings ---
+// --- Frame Retrieval Functions ---
 
-typedef NativeFfmpegGetFrameAtTimestamp = Int32 Function(Int64 timestampMs, Pointer<Pointer<VideoFrame>> outFrame);
-typedef DartFfmpegGetFrameAtTimestamp = int Function(int timestampMs, Pointer<Pointer<VideoFrame>> outFrame);
+typedef NativeFfmpegGetVideoFrameAtTimestamp =
+    Int32 Function(Int64 timestampMs, Pointer<Pointer<VideoFrame>> outFrame);
+typedef DartFfmpegGetVideoFrameAtTimestamp = int Function(
+    int timestampMs, Pointer<Pointer<VideoFrame>> outFrame);
 
-typedef NativeFfmpegGetFrameAtIndex = Int32 Function(Int32 frameIndex, Pointer<Pointer<VideoFrame>> outFrame);
-typedef DartFfmpegGetFrameAtIndex = int Function(int frameIndex, Pointer<Pointer<VideoFrame>> outFrame);
+typedef NativeFfmpegGetVideoFrameAtIndex =
+    Int32 Function(Int32 frameIndex, Pointer<Pointer<VideoFrame>> outFrame);
+typedef DartFfmpegGetVideoFrameAtIndex = int Function(
+    int frameIndex, Pointer<Pointer<VideoFrame>> outFrame);
 
-typedef NativeFfmpegFreeFrame = Void Function(Pointer<VideoFrame> frame);
-typedef DartFfmpegFreeFrame = void Function(Pointer<VideoFrame> frame);
+typedef NativeFfmpegGetAudioFrameAtTimestamp =
+    Int32 Function(Int64 timestampMs, Pointer<Pointer<AudioFrame>> outFrame);
+typedef DartFfmpegGetAudioFrameAtTimestamp = int Function(
+    int timestampMs, Pointer<Pointer<AudioFrame>> outFrame);
+
+typedef NativeFfmpegGetAudioFrameAtIndex =
+    Int32 Function(Int32 frameIndex, Pointer<Pointer<AudioFrame>> outFrame);
+typedef DartFfmpegGetAudioFrameAtIndex = int Function(
+    int frameIndex, Pointer<Pointer<AudioFrame>> outFrame);
+
+typedef NativeFfmpegFreeVideoFrame = Void Function(Pointer<VideoFrame> frame);
+typedef DartFfmpegFreeVideoFrame = void Function(Pointer<VideoFrame> frame);
+
+typedef NativeFfmpegFreeAudioFrame = Void Function(Pointer<AudioFrame> frame);
+typedef DartFfmpegFreeAudioFrame = void Function(Pointer<AudioFrame> frame);
 
 // --- Bindings Class ---
 
@@ -137,36 +125,53 @@ class LotterwiseFfmpegBindings {
   late final DartFfmpegRelease release;
   late final DartFfmpegOpenMedia openMedia;
   late final DartFfmpegGetMediaInfo getMediaInfo;
-  late final DartFfmpegStartDecoding startDecoding;
-  late final DartFfmpegPause pause;
-  late final DartFfmpegResume resume;
-  late final DartFfmpegStop stop;
   late final DartFfmpegSeek seek;
   late final DartFfmpegSeekFrame seekFrame;
-  late final DartFfmpegSetCallbacks setCallbacks;
-  
-  late final DartFfmpegGetFrameAtTimestamp getFrameAtTimestamp;
-  late final DartFfmpegGetFrameAtIndex getFrameAtIndex;
-  late final DartFfmpegFreeFrame freeFrame;
+  late final DartFfmpegStop stop;
+
+  late final DartFfmpegGetVideoFrameAtTimestamp getVideoFrameAtTimestamp;
+  late final DartFfmpegGetVideoFrameAtIndex getVideoFrameAtIndex;
+  late final DartFfmpegGetAudioFrameAtTimestamp getAudioFrameAtTimestamp;
+  late final DartFfmpegGetAudioFrameAtIndex getAudioFrameAtIndex;
+  late final DartFfmpegFreeVideoFrame freeVideoFrame;
+  late final DartFfmpegFreeAudioFrame freeAudioFrame;
 
   LotterwiseFfmpegBindings() {
     _dylib = _loadDynamicLibrary();
 
-    init = _dylib.lookupFunction<NativeFfmpegInit, DartFfmpegInit>('ffmpeg_init');
-    release = _dylib.lookupFunction<NativeFfmpegRelease, DartFfmpegRelease>('ffmpeg_release');
-    openMedia = _dylib.lookupFunction<NativeFfmpegOpenMedia, DartFfmpegOpenMedia>('ffmpeg_open_media');
-    getMediaInfo = _dylib.lookupFunction<NativeFfmpegGetMediaInfo, DartFfmpegGetMediaInfo>('ffmpeg_get_media_info');
-    startDecoding = _dylib.lookupFunction<NativeFfmpegStartDecoding, DartFfmpegStartDecoding>('ffmpeg_start_decoding');
-    pause = _dylib.lookupFunction<NativeFfmpegPause, DartFfmpegPause>('ffmpeg_pause');
-    resume = _dylib.lookupFunction<NativeFfmpegResume, DartFfmpegResume>('ffmpeg_resume');
-    stop = _dylib.lookupFunction<NativeFfmpegStop, DartFfmpegStop>('ffmpeg_stop');
-    seek = _dylib.lookupFunction<NativeFfmpegSeek, DartFfmpegSeek>('ffmpeg_seek');
-    seekFrame = _dylib.lookupFunction<NativeFfmpegSeekFrame, DartFfmpegSeekFrame>('ffmpeg_seek_frame');
-    setCallbacks = _dylib.lookupFunction<NativeFfmpegSetCallbacks, DartFfmpegSetCallbacks>('ffmpeg_set_callbacks');
+    init = _dylib.lookupFunction<NativeFfmpegInit, DartFfmpegInit>(
+        'ffmpeg_init');
+    release = _dylib.lookupFunction<NativeFfmpegRelease, DartFfmpegRelease>(
+        'ffmpeg_release');
+    openMedia = _dylib.lookupFunction<NativeFfmpegOpenMedia,
+        DartFfmpegOpenMedia>('ffmpeg_open_media');
+    getMediaInfo = _dylib.lookupFunction<NativeFfmpegGetMediaInfo,
+        DartFfmpegGetMediaInfo>('ffmpeg_get_media_info');
+    seek = _dylib.lookupFunction<NativeFfmpegSeek, DartFfmpegSeek>(
+        'ffmpeg_seek');
+    seekFrame = _dylib.lookupFunction<NativeFfmpegSeekFrame, DartFfmpegSeekFrame>(
+        'ffmpeg_seek_frame');
+    stop =
+        _dylib.lookupFunction<NativeFfmpegStop, DartFfmpegStop>('ffmpeg_stop');
 
-    getFrameAtTimestamp = _dylib.lookupFunction<NativeFfmpegGetFrameAtTimestamp, DartFfmpegGetFrameAtTimestamp>('ffmpeg_get_frame_at_timestamp');
-    getFrameAtIndex = _dylib.lookupFunction<NativeFfmpegGetFrameAtIndex, DartFfmpegGetFrameAtIndex>('ffmpeg_get_frame_at_index');
-    freeFrame = _dylib.lookupFunction<NativeFfmpegFreeFrame, DartFfmpegFreeFrame>('ffmpeg_free_frame');
+    getVideoFrameAtTimestamp = _dylib.lookupFunction<
+        NativeFfmpegGetVideoFrameAtTimestamp,
+        DartFfmpegGetVideoFrameAtTimestamp>(
+        'ffmpeg_get_video_frame_at_timestamp');
+    getVideoFrameAtIndex = _dylib.lookupFunction<
+        NativeFfmpegGetVideoFrameAtIndex, DartFfmpegGetVideoFrameAtIndex>(
+        'ffmpeg_get_video_frame_at_index');
+    getAudioFrameAtTimestamp = _dylib.lookupFunction<
+        NativeFfmpegGetAudioFrameAtTimestamp,
+        DartFfmpegGetAudioFrameAtTimestamp>(
+        'ffmpeg_get_audio_frame_at_timestamp');
+    getAudioFrameAtIndex = _dylib.lookupFunction<
+        NativeFfmpegGetAudioFrameAtIndex, DartFfmpegGetAudioFrameAtIndex>(
+        'ffmpeg_get_audio_frame_at_index');
+    freeVideoFrame = _dylib.lookupFunction<NativeFfmpegFreeVideoFrame,
+        DartFfmpegFreeVideoFrame>('ffmpeg_free_video_frame');
+    freeAudioFrame = _dylib.lookupFunction<NativeFfmpegFreeAudioFrame,
+        DartFfmpegFreeAudioFrame>('ffmpeg_free_audio_frame');
   }
 
   static DynamicLibrary _loadDynamicLibrary() {
