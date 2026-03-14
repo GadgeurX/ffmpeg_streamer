@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Project level CMake
-project(ffmpeg_streamer_plugin LANGUAGES CCXX)
+project(ffmpeg_streamer_plugin LANGUAGES C CXX)
 
 # Source files
 set(SOURCE_FILES
